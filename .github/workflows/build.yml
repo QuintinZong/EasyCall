@@ -1,6 +1,9 @@
 name: Build and package
 
-# 触发条件: 推送到 main/master、PR、v* 标签、以及手动运行
+# 触发条件:
+#   push   -> main/master (自动 Pre-Release), v* 标签 (自动正式 Release)
+#   PR     -> 仅构建 + Artifact
+#   手动   -> 选择发布模式 (none / prerelease / release)
 on:
   push:
     branches: [ main, master ]
@@ -8,9 +11,24 @@ on:
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      publish_mode:
+        description: 发布模式 (手动运行时选择)
+        required: true
+        default: none
+        type: choice
+        options:
+          - none          # 只构建并上传 Artifact, 不发布
+          - prerelease    # 发布/更新 Pre-Release (滚动 dev-build 标签)
+          - release       # 发布正式 Release (版本号取下方 "version", 留空自动 manual-v构建号)
+      version:
+        description: 正式 Release 版本号 (仅 release 模式有效, 例 v1.0)
+        required: false
+        default: ""
+        type: string
 
 permissions:
-  contents: write   # 打标签时自动创建 Release 需要
+  contents: write   # 自动发布 Release / Pre-Release 需要
 
 jobs:
   build-windows:
@@ -64,9 +82,71 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach to GitHub Release (仅 v* 标签触发)
-        if: startsWith(github.ref, 'refs/tags/')
+      # ============ 自动发布通道 (push 触发) ============
+
+      - name: Publish Pre-Release (main 推送自动)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: dev-build
+          name: "EasyCall Pre-Release #${{ github.run_number }}"
+          body: |
+            自动构建产生的预发布版本(滚动更新, 最新一次推送覆盖此条目)。
+
+            提交: ${{ github.event.head_commit.message }}
+            SHA: ${{ github.sha }}
+            构建号: #${{ github.run_number }}
+            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
           files: EasyCall-Windows-x64.zip
           draft: false
+          prerelease: true
+
+      - name: Publish Release (v* 标签)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: EasyCall ${{ github.ref_name }}
+          body: |
+            自动构建发布。
+
+            提交: ${{ github.event.head_commit.message }}
+            构建号: #${{ github.run_number }}
+            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
+          files: EasyCall-Windows-x64.zip
+          draft: false
+          prerelease: false
+
+      # ============ 手动发布通道 (workflow_dispatch) ============
+
+      - name: Publish Pre-Release (手动选择)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_mode == 'prerelease'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-build
+          name: "EasyCall Pre-Release #${{ github.run_number }} (手动)"
+          body: |
+            手动触发的预发布版本(滚动更新 dev-build 标签)。
+
+            SHA: ${{ github.sha }}
+            构建号: #${{ github.run_number }}
+            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
+          files: EasyCall-Windows-x64.zip
+          draft: false
+          prerelease: true
+
+      - name: Publish Release (手动选择)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_mode == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
+          name: EasyCall ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
+          body: |
+            手动触发发布的正式版本。
+
+            SHA: ${{ github.sha }}
+            构建号: #${{ github.run_number }}
+            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
+          files: EasyCall-Windows-x64.zip
+          draft: false
+          prerelease: false
