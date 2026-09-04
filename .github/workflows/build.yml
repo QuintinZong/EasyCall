@@ -91,12 +91,9 @@ jobs:
           tag_name: dev-build
           name: "EasyCall Pre-Release #${{ github.run_number }}"
           body: |
-            自动构建产生的预发布版本(滚动更新, 最新一次推送覆盖此条目)。
-
-            提交: ${{ github.event.head_commit.message }}
+            自动构建产生的预发布版本
+            Commit: ${{ github.event.head_commit.message }}
             SHA: ${{ github.sha }}
-            构建号: #${{ github.run_number }}
-            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
           files: EasyCall-Windows-x64.zip
           draft: false
           prerelease: true
@@ -108,11 +105,8 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: EasyCall ${{ github.ref_name }}
           body: |
-            自动构建发布。
-
-            提交: ${{ github.event.head_commit.message }}
-            构建号: #${{ github.run_number }}
-            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
+            自动构建发布
+            Commit: ${{ github.event.head_commit.message }}
           files: EasyCall-Windows-x64.zip
           draft: false
           prerelease: false
@@ -126,11 +120,7 @@ jobs:
           tag_name: dev-build
           name: "EasyCall Pre-Release #${{ github.run_number }} (手动)"
           body: |
-            手动触发的预发布版本(滚动更新 dev-build 标签)。
-
             SHA: ${{ github.sha }}
-            构建号: #${{ github.run_number }}
-            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
           files: EasyCall-Windows-x64.zip
           draft: false
           prerelease: true
@@ -142,11 +132,8 @@ jobs:
           tag_name: ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
           name: EasyCall ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
           body: |
-            手动触发发布的正式版本。
-
+            Commit: ${{ github.event.head_commit.message }}
             SHA: ${{ github.sha }}
-            构建号: #${{ github.run_number }}
-            附件的 zip 内含两个 exe (教师端 + 班级大屏端), 解压即用。
           files: EasyCall-Windows-x64.zip
           draft: false
           prerelease: false
