@@ -59,9 +59,14 @@
 2. **构建**：CI 安装 MSYS2 + MinGW-w64（同款工具链）→ `build.bat -nopause` 编译两个 exe；
 3. **冒烟**：用 `--ui=` 自截图验证界面渲染（尽力而为，失败不阻断）；
 4. **打包**：`EasyCall-Windows-x64.zip`（仅含两个 exe）；
-5. **交付**：每次构建 zip 上传为 Artifact（Actions 运行页下载）；推 `v*` 标签时自动挂到 Release：
-   ```bash
-   git tag v1.0 && git push origin v1.0
-   ```
+5. **交付**：
+   - 每次构建 zip 上传为 Artifact（Actions 运行页下载，保留 30 天）；
+   - **推 `main`/`master`**：自动发布 **Pre-Release**（滚动更新 `dev-build` 标签，仓库主页可见最新预发布产物）；
+   - **推 `v*` 标签**：发布**正式 Release**：
+     ```bash
+     git tag v1.0 && git push origin v1.0
+     ```
+   - **手动运行**（Actions → 本工作流 → Run workflow）可选择发布模式：
+     `none`(仅构建) / `prerelease`(Pre-Release) / `release`(正式版，可填版本号，留空自动为 `manual-v构建号`)。
 
 配套 `.gitignore`（忽略构建产物/运行数据）与 `.gitattributes`（bat 强制 CRLF，避免 CI 上批处理解析出错）已就绪，`git add .` 即可。
