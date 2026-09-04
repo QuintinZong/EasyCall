@@ -1,0 +1,14 @@
+# 构建产物 / 运行数据不入库
+build/
+dist/
+*.exe
+*.log
+xlsxtest.out
+students.json
+easycall.ini
+uisnap.log
+shot_*.png
+smoke_*.png
+
+# 服务器端代码/部署文档(含服务器信息)不公开
+server/

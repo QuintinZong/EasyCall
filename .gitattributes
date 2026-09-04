@@ -1,0 +1,11 @@
+# 统一行尾: bat 用 CRLF(批处理必需), 其余源码用 LF
+* text=auto
+*.bat text eol=crlf
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.php text eol=lf
+*.js text eol=lf
+*.csv text eol=lf
+*.rc text eol=lf

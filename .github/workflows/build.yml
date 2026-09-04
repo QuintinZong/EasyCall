@@ -1,0 +1,72 @@
+name: Build and package
+
+# 触发条件: 推送到 main/master、PR、v* 标签、以及手动运行
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 打标签时自动创建 Release 需要
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 + MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-winpthreads
+
+      - name: Build (调用与本地一致的 build.bat)
+        shell: msys2 {0}
+        run: |
+          cmd.exe //c "build.bat -nopause"
+          ls -la dist
+
+      - name: Smoke test (自截图验证界面, 尽力而为)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          function Run-Snap($exe, $out) {
+            $p = Start-Process "dist\$exe" -ArgumentList "--ui=$PWD\$out" -WorkingDirectory "dist" -PassThru
+            for ($i = 0; $i -lt 20 -and -not $p.HasExited; $i++) { Start-Sleep -Milliseconds 500 }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            if (-not (Test-Path "$PWD\$out")) { "[WARN] $exe 界面截图未生成" }
+            else { "$exe UI OK -> $out" }
+          }
+          Run-Snap "EasyCall-Teacher.exe" "smoke_teacher.png"
+          Run-Snap "EasyCall-Board.exe"   "smoke_board.png"
+
+      - name: Clean runtime files and package zip
+        shell: pwsh
+        run: |
+          Remove-Item dist\easycall.ini, dist\students.json, dist\uisnap.log -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath EasyCall-Windows-x64.zip -Force
+          Get-Item EasyCall-Windows-x64.zip | Select-Object Name, Length | Format-Table -AutoSize | Out-String
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyCall-Windows-x64
+          path: EasyCall-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release (仅 v* 标签触发)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EasyCall-Windows-x64.zip
+          draft: false
