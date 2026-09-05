@@ -46,7 +46,10 @@
   可手动输入大屏 IP；检查 Windows 防火墙是否放行 25800/25801 端口(首次运行弹窗点允许)。
 - **端口被占用**：在大屏端设置里切换一个端口(教师端地址里填写 `IP:端口`)。
 
-## 重新构建
+## 构建
 
-本地双击 `build.bat`（构建完成窗口驻留，按任意键关闭）；CI/自动调用用 `build.bat -nopause`。
-需要 `g++`(MinGW-w64) 与 `windres`，产物输出至 `dist/`。
+本地构建：双击 `build.bat`（构建完成窗口驻留，按任意键关闭）；
+
+Github Action构建：CI/自动调用用 `build.bat -nopause`。
+
+需要 MinGW-w64 与 `windres`，产物输出至 `dist/`。
