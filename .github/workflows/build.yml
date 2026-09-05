@@ -68,17 +68,32 @@ jobs:
           Run-Snap "EasyCall-Board.exe"   "smoke_board.png"
 
       - name: Clean runtime files and package zip
+        id: package
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          MODE: ${{ github.event.inputs.publish_mode }}
+          VERSION: ${{ github.event.inputs.version }}
+          RUN_NUM: ${{ github.run_number }}
         run: |
           Remove-Item dist\easycall.ini, dist\students.json, dist\uisnap.log -Force -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist/* -DestinationPath EasyCall-Windows-x64.zip -Force
-          Get-Item EasyCall-Windows-x64.zip | Select-Object Name, Length | Format-Table -AutoSize | Out-String
+          # 推导版本号: 标签推送=v标签名; 手动release=填写的版本号(或 manual-v构建号); 其余=dev-build
+          $ver = "dev-build"
+          if ($env:EVENT_NAME -eq "push" -and $env:REF_NAME.StartsWith("v")) { $ver = $env:REF_NAME }
+          elseif ($env:EVENT_NAME -eq "workflow_dispatch" -and $env:MODE -eq "release") {
+            $ver = if ($env:VERSION) { $env:VERSION } else { "manual-v$env:RUN_NUM" }
+          }
+          $zip = "EasyCall $ver Windows-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length | Format-Table -AutoSize | Out-String
+          "ZIPNAME=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EasyCall-Windows-x64
-          path: EasyCall-Windows-x64.zip
+          path: ${{ steps.package.outputs.ZIPNAME }}
           if-no-files-found: error
           retention-days: 30
 
@@ -90,11 +105,8 @@ jobs:
         with:
           tag_name: dev-build
           name: "EasyCall Pre-Release #${{ github.run_number }}"
-          body: |
-            自动构建产生的预发布版本
-            Commit: ${{ github.event.head_commit.message }}
-            SHA: ${{ github.sha }}
-          files: EasyCall-Windows-x64.zip
+          body: "Full Changelog: https://github.com/QuintinZong/EasyCall/commits/"
+          files: ${{ steps.package.outputs.ZIPNAME }}
           draft: false
           prerelease: true
 
@@ -104,10 +116,8 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: EasyCall ${{ github.ref_name }}
-          body: |
-            自动构建发布
-            Commit: ${{ github.event.head_commit.message }}
-          files: EasyCall-Windows-x64.zip
+          body: "Full Changelog: https://github.com/QuintinZong/EasyCall/commits/"
+          files: ${{ steps.package.outputs.ZIPNAME }}
           draft: false
           prerelease: false
 
@@ -119,9 +129,8 @@ jobs:
         with:
           tag_name: dev-build
           name: "EasyCall Pre-Release #${{ github.run_number }} (手动)"
-          body: |
-            SHA: ${{ github.sha }}
-          files: EasyCall-Windows-x64.zip
+          body: "Full Changelog: https://github.com/QuintinZong/EasyCall/commits/"
+          files: ${{ steps.package.outputs.ZIPNAME }}
           draft: false
           prerelease: true
 
@@ -131,9 +140,7 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
           name: EasyCall ${{ github.event.inputs.version != '' && github.event.inputs.version || format('manual-v{0}', github.run_number) }}
-          body: |
-            Commit: ${{ github.event.head_commit.message }}
-            SHA: ${{ github.sha }}
-          files: EasyCall-Windows-x64.zip
+          body: "Full Changelog: https://github.com/QuintinZong/EasyCall/commits/"
+          files: ${{ steps.package.outputs.ZIPNAME }}
           draft: false
           prerelease: false
