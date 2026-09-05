@@ -11,7 +11,7 @@
 |---|---|
 | `dist/EasyCall-Teacher.exe` | 教师端：导入名单、勾选叫号、发送清屏 |
 | `dist/EasyCall-Board.exe`   | 班级大屏端：全屏大字显示被叫学生 |
-| `build.bat`                 | 一键重新构建(需要 MinGW-w64 的 g++) |
+| `build.bat`                 | 一键重新构建(需要 MinGW-w64) |
 
 ## 网络模式选择
 
@@ -50,23 +50,3 @@
 
 本地双击 `build.bat`（构建完成窗口驻留，按任意键关闭）；CI/自动调用用 `build.bat -nopause`。
 需要 `g++`(MinGW-w64) 与 `windres`，产物输出至 `dist/`。
-
-## 自动构建 (GitHub Actions)
-
-`.github/workflows/build.yml` 推送后自动运行：
-
-1. **触发**：推送到 `main`/`master`、PR、`v*` 标签、或 Actions 页面手动运行；
-2. **构建**：CI 安装 MSYS2 + MinGW-w64（同款工具链）→ `build.bat -nopause` 编译两个 exe；
-3. **冒烟**：用 `--ui=` 自截图验证界面渲染（尽力而为，失败不阻断）；
-4. **打包**：`EasyCall-Windows-x64.zip`（仅含两个 exe）；
-5. **交付**：
-   - 每次构建 zip 上传为 Artifact（Actions 运行页下载，保留 30 天）；
-   - **推 `main`/`master`**：自动发布 **Pre-Release**（滚动更新 `dev-build` 标签，仓库主页可见最新预发布产物）；
-   - **推 `v*` 标签**：发布**正式 Release**：
-     ```bash
-     git tag v1.0 && git push origin v1.0
-     ```
-   - **手动运行**（Actions → 本工作流 → Run workflow）可选择发布模式：
-     `none`(仅构建) / `prerelease`(Pre-Release) / `release`(正式版，可填版本号，留空自动为 `manual-v构建号`)。
-
-配套 `.gitignore`（忽略构建产物/运行数据）与 `.gitattributes`（bat 强制 CRLF，避免 CI 上批处理解析出错）已就绪，`git add .` 即可。
