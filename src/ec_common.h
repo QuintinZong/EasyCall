@@ -34,10 +34,14 @@ void EcNetStop();
 bool        TcpSendFrame(SOCKET s, const std::string& payload);
 std::string TcpRecvFrame(SOCKET s, int timeoutMs, bool* ok);  // ok=false: 超时或断开
 
-// items: 每项 "学号\t姓名\t班级"; 生成 "CALL\n<callId>\n<item>\n..."
-std::string BuildCallPayload(const std::vector<std::wstring>& items, std::string* callIdOut);
+// items: 每项 "学号\t姓名\t班级"
+// 生成 "CALL\n<callId>\n<地点>\n<教师名>\n<item>\n..."
+std::string BuildCallPayload(const std::wstring& place, const std::wstring& teacher,
+                             const std::vector<std::wstring>& items, std::string* callIdOut);
 std::vector<std::string> SplitLines(const std::string& s);
 std::vector<std::string> SplitTabs(const std::string& s);
+int ParseFrames(const std::string& body, std::vector<std::string>& out);   // 解析 4字节长度前缀帧流
+long long HttpSeqFromHeader(const std::string& hdr);                       // 从响应头取 X-EasyCall-Seq
 
 // ---------------- UDP 发现 ----------------
 struct BoardInfo { std::wstring name, ip; unsigned short port; };
