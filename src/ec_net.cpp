@@ -122,12 +122,42 @@ std::vector<std::string> SplitTabs(const std::string& s) {
     return out;
 }
 
-std::string BuildCallPayload(const std::vector<std::wstring>& items, std::string* callIdOut) {
+std::string BuildCallPayload(const std::wstring& place, const std::wstring& teacher,
+                             const std::vector<std::wstring>& items, std::string* callIdOut) {
     std::string callId = NowStampMs();
-    std::string out = "CALL\n" + callId + "\n";
+    std::string out = "CALL\n" + callId + "\n" + WU8(place) + "\n" + WU8(teacher) + "\n";
     for (auto& it : items) out += WU8(it) + "\n";
     if (callIdOut) *callIdOut = callId;
     return out;
+}
+
+int ParseFrames(const std::string& body, std::vector<std::string>& out) {
+    out.clear();
+    size_t pos = 0;
+    while (pos + 4 <= body.size()) {
+        // 服务器(pack('N') / writeUInt32BE)使用大端长度前缀
+        uint32_t len = ((uint32_t)(uint8_t)body[pos] << 24) |
+                       ((uint32_t)(uint8_t)body[pos + 1] << 16) |
+                       ((uint32_t)(uint8_t)body[pos + 2] << 8) |
+                       (uint32_t)(uint8_t)body[pos + 3];
+        pos += 4;
+        if (len == 0 || len > EC_FRAME_MAX || pos + len > body.size()) break;   // 尾部异常则停止
+        out.push_back(body.substr(pos, len));
+        pos += len;
+    }
+    return (int)out.size();
+}
+
+long long HttpSeqFromHeader(const std::string& hdr) {
+    std::string h = hdr;
+    for (auto& c : h) c = (char)tolower((unsigned char)c);
+    size_t p = h.find("x-easycall-seq:");
+    if (p == std::string::npos) return 0;
+    p += 15;
+    while (p < h.size() && h[p] == ' ') p++;
+    long long v = 0;
+    while (p < h.size() && isdigit((unsigned char)h[p])) { v = v * 10 + (h[p] - '0'); p++; }
+    return v;
 }
 
 // ================= UDP 发现 =================
