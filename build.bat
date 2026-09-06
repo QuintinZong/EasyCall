@@ -1,10 +1,9 @@
 @echo off
 rem ============================================================
 rem  EasyCall 班级叫号系统 - 一键构建脚本 (MinGW-w64)
-rem  产物: dist\EasyCall-Teacher.exe (教师端)
-rem         dist\EasyCall-Board.exe   (班级大屏端)
-rem  本地双击: 构建完成后停留, 按任意键关闭
-rem  CI/自动调用: build.bat -nopause  (不驻留窗口)
+rem  产物输出: dist\EasyCall-Teacher.exe (教师端)
+rem         dist\EasyCall-Board.exe  	  (教室端)
+rem Gtihub构建：自动调用build.bat -nopause
 rem ============================================================
 setlocal
 cd /d "%~dp0"
@@ -36,9 +35,9 @@ if errorlevel 1 goto :err
 
 echo.
 echo ============================================
-echo   构建成功!
+echo   构建成功
 echo   教师端:   dist\EasyCall-Teacher.exe
-echo   大屏端:   dist\EasyCall-Board.exe
+echo   教室端:   dist\EasyCall-Board.exe
 echo ============================================
 echo.
 if /i "%~1" NEQ "-nopause" pause
@@ -47,7 +46,7 @@ exit /b 0
 :err
 echo.
 echo ============================================
-echo   构建失败, 请查看上方错误信息
+echo   构建失败, 请查看错误信息
 echo ============================================
 echo.
 if /i "%~1" NEQ "-nopause" pause
