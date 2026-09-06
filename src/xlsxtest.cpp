@@ -95,6 +95,16 @@ static void EchoClient() {
 
 static void PushFrame(int port, const std::string& text) {
     // 一次性发送一个帧(端到端测试): --push <port> <text>
+    // 命令行参数可能是 ANSI/GBK, 统一转成协议要求的 UTF-8
+    std::string payload;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), (int)text.size(), nullptr, 0) > 0) {
+        payload = text;   // 已是合法 UTF-8
+    } else {
+        int n = MultiByteToWideChar(936, 0, text.data(), (int)text.size(), nullptr, 0);
+        std::wstring w(n, 0);
+        MultiByteToWideChar(936, 0, text.data(), (int)text.size(), &w[0], n);
+        payload = WU8(w);
+    }
     EcNetStart();
     SOCKET c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in sa;
@@ -104,13 +114,13 @@ static void PushFrame(int port, const std::string& text) {
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int ok = 0;
     if (connect(c, (sockaddr*)&sa, sizeof sa) == 0) {
-        ok = TcpSendFrame(c, text) ? 1 : 0;
+        ok = TcpSendFrame(c, payload) ? 1 : 0;
         Sleep(150);
     }
     closesocket(c);
     EcNetStop();
     FILE* fh = fopen("xlsxtest.out", "wb");
-    if (fh) { fprintf(fh, "push=%d len=%d\n", ok, (int)text.size()); fclose(fh); }
+    if (fh) { fprintf(fh, "push=%d len=%d\n", ok, (int)payload.size()); fclose(fh); }
 }
 
 int main(int argc, char** argv) {
