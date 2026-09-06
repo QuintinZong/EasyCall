@@ -1,4 +1,4 @@
-// EasyCall 班级叫号系统 - 教师端 (Fluent/WinUI 界面风格, GDI+ 自绘)
+// EasyCall 班级叫号系统 - 教师端
 #define _WIN32_IE 0x0600
 #include "ec_common.h"
 #include "ec_xlsx.h"
@@ -20,14 +20,20 @@ using namespace Gdiplus;
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdiplus.lib")
 
+#define WM_APP_CHAT (WM_APP + 2)
+
 struct Student { std::wstring id, name, cls; };
 
 enum : INT_PTR {
-    IDC_LV = 100, IDC_BTN_IMPORT, IDC_BTN_SELALL, IDC_BTN_SELNONE, IDC_BTN_INVERT,
-    IDC_BTN_DEL, IDC_BTN_CALL, IDC_BTN_CLEAR, IDC_BTN_BLACK,
+    IDC_LV = 100, IDC_BTN_IMPORT, IDC_BTN_MANUAL, IDC_BTN_SELALL, IDC_BTN_SELNONE, IDC_BTN_INVERT,
+    IDC_BTN_DEL, IDC_BTN_CHAT, IDC_BTN_CALL, IDC_BTN_CLEAR, IDC_BTN_BLACK,
     IDC_RB_LAN, IDC_RB_RELAY, IDC_BTN_SCAN, IDC_COMBO_BOARD,
     IDC_ED_BASE, IDC_ED_ROOM, IDC_BTN_TEST, IDC_HIST, IDC_STATUS,
-    IDC_LBL_BASE, IDC_LBL_ROOM, IDC_LBL_NET, IDC_LBL_HISTY
+    IDC_LBL_BASE, IDC_LBL_ROOM, IDC_LBL_NET, IDC_LBL_HISTY,
+    IDC_LBL_PLACE, IDC_ED_PLACE, IDC_CK_CLS,
+    IDC_CHAT_LOG = 200, IDC_CHAT_INPUT, IDC_CHAT_SEND,
+    IDC_NAME_EDIT = 210, IDC_NAME_OK,
+    IDC_ADD_ID = 220, IDC_ADD_NAME, IDC_ADD_CLS, IDC_ADD_OK, IDC_ADD_DONE
 };
 
 // ---------------- Fluent 配色 ----------------
@@ -45,20 +51,37 @@ static const COLORREF C_TEXT2    = RGB(0x60, 0x5E, 0x5C);
 static HINSTANCE g_hInst;
 static HWND g_hwnd, g_lv, g_hist, g_status;
 static HWND g_rbLan, g_rbRelay, g_btnScan, g_comboBoard, g_edBase, g_edRoom, g_btnTest;
-static HWND g_btnCall, g_btnBlack;
-static HWND g_lblBase, g_lblRoom, g_lblNet, g_lblHisty;
+static HWND g_btnCall;
+static HWND g_lblBase, g_lblRoom, g_lblNet, g_lblHisty, g_lblPlace;
+static HWND g_edPlace, g_ckCls;
+static HWND g_chatWnd = nullptr, g_chatLog = nullptr, g_chatInput = nullptr;
+static HWND g_addDlg = nullptr, g_nameEdit = nullptr;
 static std::vector<HWND> g_controls;
 static std::vector<Student> g_students;
+static std::vector<std::wstring> g_chatMsgs;       // 对话记录 "HH:MM:SS 姓名: 内容"
+static std::vector<std::string> g_sentChatIds;     // 已发送的聊天ID(中转回显去重用)
+static std::wstring g_teacherName = L"教师";
+static bool g_showCls = true;
 static SOCKET g_sock = INVALID_SOCKET;
 static std::atomic<bool> g_stop{false};
 static volatile LONG g_presenceSec = -1;
+static volatile LONG g_chatSeq = 0;
 static int g_dpi = 96;
 static HFONT g_fontUi = nullptr, g_fontBold = nullptr, g_fontTitle = nullptr;
 static HWND g_hoverBtn = nullptr;
-static std::thread g_presenceThread;
+static std::thread g_presenceThread, g_lanRecvThread, g_chatFetchThread;
 static std::wstring g_uiSnapPath;   // --ui= 自截图调试功能
 static int g_forceDpi = 0;          // --ui 调试时强制 96 DPI
+static bool (*g_chatSender)(const std::wstring&) = nullptr;
 static void DoUiSnap();
+
+// 前置声明(定义在文件后部)
+static bool LanConnect(const std::wstring& hostPort, std::wstring& err);
+static void CloseLan();
+static void RefreshListView();
+static void SaveStudents();
+static void HistAdd(const std::wstring& line);
+static void EnsureChatWindow(bool focus = true);
 
 static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
@@ -89,6 +112,319 @@ static std::wstring GetRoom() { return TrimW(WinText(g_edRoom)); }
 
 static void SetStatus(const std::wstring& t) {
     if (g_status) SetWindowTextW(g_status, t.c_str());
+}
+
+// ---------------- 对话: 持久化 ----------------
+static std::wstring ChatFile() { return ExeDirW() + L"chat_teacher.json"; }
+static void ChatSave() {
+    std::string json = "[";
+    for (size_t i = 0; i < g_chatMsgs.size(); i++) {
+        if (i) json += ",";
+        json += "{\"t\":\"" + JsonEscape(WU8(g_chatMsgs[i])) + "\"}";
+    }
+    json += "]";
+    HANDLE h = CreateFileW(ChatFile().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(h, json.data(), (DWORD)json.size(), &w, nullptr);
+        CloseHandle(h);
+    }
+}
+static void ChatLoad() {
+    g_chatMsgs.clear();
+    HANDLE h = CreateFileW(ChatFile().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD hi = 0;
+    DWORD size = GetFileSize(h, &hi);
+    if (hi || size == 0 || size > 4 * 1024 * 1024) { CloseHandle(h); return; }
+    std::string json(size, 0);
+    DWORD got = 0;
+    if (!ReadFile(h, &json[0], size, &got, nullptr) || got != size) { CloseHandle(h); return; }
+    CloseHandle(h);
+    size_t pos = 0;
+    for (;;) {
+        size_t a = json.find('{', pos);
+        if (a == std::string::npos) break;
+        size_t b = json.find('}', a);
+        if (b == std::string::npos) break;
+        std::wstring t = U8W(JsonStrVal(json.substr(a, b - a + 1), "t"));
+        if (!t.empty()) g_chatMsgs.push_back(t);
+        pos = b + 1;
+    }
+}
+static void ChatWipe() {
+    DeleteFileW(ChatFile().c_str());
+    g_chatMsgs.clear();
+}
+static void ChatLogAppend(const std::wstring& line) {
+    if (!g_chatLog) return;
+    int len = GetWindowTextLengthW(g_chatLog);
+    SendMessageW(g_chatLog, EM_SETSEL, len, len);
+    std::wstring out = line + L"\r\n";
+    SendMessageW(g_chatLog, EM_REPLACESEL, 0, (LPARAM)out.c_str());
+}
+static void ChatAppend(const std::wstring& sender, const std::wstring& text) {
+    g_chatMsgs.push_back(NowTimeW() + L" " + sender + L": " + text);
+    while (g_chatMsgs.size() > 500) g_chatMsgs.erase(g_chatMsgs.begin());
+    ChatLogAppend(g_chatMsgs.back());
+    ChatSave();
+}
+static void OnChatFrame(const std::string& frame) {
+    std::vector<std::string> lines = SplitLines(frame);
+    if (lines.size() < 3 || lines[0] != "CHAT") return;
+    for (auto& s : g_sentChatIds) if (s == lines[1]) return;   // 自己发的回显, 跳过
+    std::wstring sender = U8W(lines[2]);
+    std::wstring text;
+    for (size_t i = 3; i < lines.size(); i++) {
+        if (i > 3) text += L"\n";
+        text += U8W(lines[i]);
+    }
+    ChatAppend(sender, text);
+    // 收到消息自动弹出对话窗口(不抢焦点)
+    if (g_chatWnd && IsWindow(g_chatWnd)) ShowWindow(g_chatWnd, SW_SHOW);
+    else EnsureChatWindow(false);
+}
+
+// ---------------- 发送 ----------------
+static bool SendToBoard(const std::string& payload, std::wstring& errOut) {
+    if (IsRelayMode()) {
+        if (GetRelayBase().empty()) { errOut = L"请先填写服务器地址(如 http://IP:端口/)"; return false; }
+        std::string room = WU8(GetRoom());
+        if (room.empty()) { errOut = L"请先填写房间号(与班级大屏端一致)"; return false; }
+        std::string body = "room=" + UrlEncode(room) + "&data=" + UrlEncode(payload);
+        std::string resp;
+        std::wstring err;
+        if (!HttpPostForm(GetRelayBase() + L"push.php", body, resp, err, 12)) { errOut = err; return false; }
+        if (resp.find("OK") == std::string::npos) { errOut = L"服务器返回异常: " + U8W(resp); return false; }
+        return true;
+    } else {
+        if (g_sock == INVALID_SOCKET) {
+            std::wstring host = WinText(g_comboBoard);
+            if (host.empty()) { errOut = L"请先点击[扫描教室]或手动填写教室端IP地址"; return false; }
+            std::wstring e2;
+            if (!LanConnect(host, e2)) { errOut = e2; return false; }
+            IniSet(L"net", L"lan_host", TrimW(host));
+        }
+        if (!TcpSendFrame(g_sock, payload)) {
+            CloseLan();
+            errOut = L"发送失败, 与教室端的连接已断开";
+            return false;
+        }
+        return true;
+    }
+}
+
+static bool TeacherSendChat(const std::wstring& text) {
+    std::wstring t = TrimW(text);
+    if (t.empty()) return false;
+    std::string msgId = NowStampMs();
+    g_sentChatIds.push_back(msgId);
+    while (g_sentChatIds.size() > 64) g_sentChatIds.erase(g_sentChatIds.begin());
+    std::string payload = "CHAT\n" + msgId + "\n" + WU8(g_teacherName) + "\n" + WU8(t);
+    std::wstring err;
+    if (!SendToBoard(payload, err)) {
+        ChatAppend(L"系统", L"发送失败: " + err);
+        return false;
+    }
+    ChatAppend(g_teacherName, t);
+    return true;
+}
+
+// ---------------- 对话窗口 ----------------
+static LRESULT CALLBACK ChatInputProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) {
+        PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_CHAT_SEND, BN_CLICKED), (LPARAM)h);
+        return 0;
+    }
+    return CallWindowProcW((WNDPROC)GetPropW(h, L"EcOrigProc"), h, m, w, l);
+}
+
+static LRESULT CALLBACK ChatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        g_chatLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+                                        ES_READONLY | ES_AUTOVSCROLL,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_LOG, g_hInst, nullptr);
+        g_chatInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                      WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                      0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_INPUT, g_hInst, nullptr);
+        WNDPROC orig = (WNDPROC)GetWindowLongPtrW(g_chatInput, GWLP_WNDPROC);
+        SetPropW(g_chatInput, L"EcOrigProc", (HANDLE)orig);
+        SetWindowLongPtrW(g_chatInput, GWLP_WNDPROC, (LONG_PTR)ChatInputProc);
+        CreateWindowExW(0, L"BUTTON", L"发送",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_SEND, g_hInst, nullptr);
+        SendMessageW(g_chatLog, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        SendMessageW(g_chatInput, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        for (auto& line : g_chatMsgs) ChatLogAppend(line);
+        return 0;
+    }
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int hh = S(30);
+        MoveWindow(g_chatLog, S(8), S(8), rc.right - S(16), rc.bottom - S(52) - hh, TRUE);
+        MoveWindow(g_chatInput, S(8), rc.bottom - hh - S(12), rc.right - S(96), hh, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDC_CHAT_SEND), rc.right - S(80), rc.bottom - hh - S(13), S(72), hh + 2, TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_CHAT_SEND) {
+            if (g_chatSender) {
+                std::wstring t = WinText(g_chatInput);
+                if (!TrimW(t).empty()) {
+                    g_chatSender(t);
+                    SetWindowTextW(g_chatInput, L"");
+                    SetFocus(g_chatInput);
+                }
+            }
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void EnsureChatWindow(bool focus) {
+    if (g_chatWnd && IsWindow(g_chatWnd)) {
+        ShowWindow(g_chatWnd, SW_SHOW);
+        if (focus) SetForegroundWindow(g_chatWnd);
+        return;
+    }
+    RECT mrc;
+    GetWindowRect(g_hwnd, &mrc);
+    g_chatWnd = CreateWindowExW(0, L"EasyCallChatWnd", L"对话 - 教师端",
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                mrc.right - S(560), mrc.top + S(80), S(540), S(540),
+                                g_hwnd, nullptr, g_hInst, nullptr);
+    ShowWindow(g_chatWnd, SW_SHOW);
+}
+
+// ---------------- 教师名弹窗(启动时, owned 非独立窗口) ----------------
+static LRESULT CALLBACK NameDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindowExW(0, L"STATIC", L"请输入教师姓名(叫号时大屏会显示)",
+                        WS_CHILD | WS_VISIBLE, S(18), S(22), S(280), S(20),
+                        hwnd, nullptr, g_hInst, nullptr);
+        std::wstring pre = IniGet(L"net", L"teacher_name", L"");
+        g_nameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pre.c_str(),
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     S(18), S(50), S(270), S(26), hwnd, (HMENU)IDC_NAME_EDIT,
+                                     g_hInst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"进入叫号",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(80), S(92), S(150), S(34), hwnd, (HMENU)IDC_NAME_OK, g_hInst, nullptr);
+        SendMessageW(g_nameEdit, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        SetFocus(g_nameEdit);
+        SendMessageW(g_nameEdit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_NAME_OK) {
+            // 先取名字再销毁(销毁后子编辑框不可用)
+            std::wstring nm = TrimW(WinText(g_nameEdit));
+            if (!nm.empty()) {
+                g_teacherName = nm;
+                IniSet(L"net", L"teacher_name", nm);
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE: {
+        std::wstring nm = TrimW(WinText(g_nameEdit));
+        if (!nm.empty()) {
+            g_teacherName = nm;
+            IniSet(L"net", L"teacher_name", nm);
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------------- 手动添加学生弹窗(owned, 非模态) ----------------
+static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        auto mkLbl = [&](const wchar_t* t, int x, int y, int w) {
+            CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE, S(x), S(y), S(w), S(18),
+                            hwnd, nullptr, g_hInst, nullptr);
+        };
+        auto mkEdit = [&](const wchar_t* t, INT_PTR id, int x, int y) -> HWND {
+            HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", t,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     S(x), S(y), S(220), S(24), hwnd, (HMENU)id, g_hInst, nullptr);
+            SendMessageW(h, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+            return h;
+        };
+        mkLbl(L"学号:", 18, 18, 60);
+        mkEdit(L"", IDC_ADD_ID, 70, 16);
+        mkLbl(L"姓名:", 18, 50, 60);
+        mkEdit(L"", IDC_ADD_NAME, 70, 48);
+        mkLbl(L"班级/备注(可选):", 18, 82, 130);
+        mkEdit(L"", IDC_ADD_CLS, 70, 80);
+        CreateWindowExW(0, L"BUTTON", L"添加",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                        S(40), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_OK, g_hInst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"完成",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                        S(170), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_DONE, g_hInst, nullptr);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == IDC_ADD_OK) {
+            std::wstring sid = TrimW(WinText(GetDlgItem(hwnd, IDC_ADD_ID)));
+            std::wstring sname = TrimW(WinText(GetDlgItem(hwnd, IDC_ADD_NAME)));
+            std::wstring scls = TrimW(WinText(GetDlgItem(hwnd, IDC_ADD_CLS)));
+            if (sname.empty()) {
+                MessageBoxW(hwnd, L"请输入学生姓名", L"提示", MB_ICONINFORMATION);
+                return 0;
+            }
+            g_students.push_back({ sid, sname, scls });
+            RefreshListView();
+            SaveStudents();
+            HistAdd(NowTimeW() + L" 手动添加: " + sname + (sid.empty() ? L"" : L"(" + sid + L")"));
+            SetWindowTextW(GetDlgItem(hwnd, IDC_ADD_ID), L"");
+            SetWindowTextW(GetDlgItem(hwnd, IDC_ADD_NAME), L"");
+            SetWindowTextW(GetDlgItem(hwnd, IDC_ADD_CLS), L"");
+            SetFocus(GetDlgItem(hwnd, IDC_ADD_ID));
+            return 0;
+        }
+        if (id == IDC_ADD_DONE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_DESTROY:
+        g_addDlg = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowAddDialog() {
+    if (g_addDlg && IsWindow(g_addDlg)) {
+        SetForegroundWindow(g_addDlg);
+        return;
+    }
+    RECT mrc;
+    GetWindowRect(g_hwnd, &mrc);
+    g_addDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"EasyCallAddDlg", L"手动添加学生",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                               mrc.left + (mrc.right - mrc.left) / 2 - S(160),
+                               mrc.top + (mrc.bottom - mrc.top) / 2 - S(100),
+                               S(330), S(190), g_hwnd, nullptr, g_hInst, nullptr);
 }
 
 // ---------------- 学生名单持久化 ----------------
@@ -259,35 +595,6 @@ static void CloseLan() {
     if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
 }
 
-// ---------------- 发送 ----------------
-static bool SendToBoard(const std::string& payload, std::wstring& errOut) {
-    if (IsRelayMode()) {
-        if (GetRelayBase().empty()) { errOut = L"请先填写服务器地址(如 http://IP:端口/)"; return false; }
-        std::string room = WU8(GetRoom());
-        if (room.empty()) { errOut = L"请先填写房间号(与班级大屏端一致)"; return false; }
-        std::string body = "room=" + UrlEncode(room) + "&data=" + UrlEncode(payload);
-        std::string resp;
-        std::wstring err;
-        if (!HttpPostForm(GetRelayBase() + L"push.php", body, resp, err, 12)) { errOut = err; return false; }
-        if (resp.find("OK") == std::string::npos) { errOut = L"服务器返回异常: " + U8W(resp); return false; }
-        return true;
-    } else {
-        if (g_sock == INVALID_SOCKET) {
-            std::wstring host = WinText(g_comboBoard);
-            if (host.empty()) { errOut = L"请先点击[扫描教室]或手动填写教室端IP地址"; return false; }
-            std::wstring e2;
-            if (!LanConnect(host, e2)) { errOut = e2; return false; }
-            IniSet(L"net", L"lan_host", TrimW(host));
-        }
-        if (!TcpSendFrame(g_sock, payload)) {
-            CloseLan();
-            errOut = L"发送失败, 与教室端的连接已断开";
-            return false;
-        }
-        return true;
-    }
-}
-
 // ---------------- 叫号 / 清屏 / 黑屏 ----------------
 static void OnCall(HWND hwnd) {
     std::vector<std::wstring> items;
@@ -295,14 +602,18 @@ static void OnCall(HWND hwnd) {
     for (int i = 0; i < n; i++) {
         if (!IsChecked(i)) continue;
         if ((size_t)i >= g_students.size()) continue;
-        items.push_back(g_students[i].id + L"\t" + g_students[i].name + L"\t" + g_students[i].cls);
+        const Student& s = g_students[i];
+        items.push_back(s.id + L"\t" + s.name + L"\t" + (g_showCls ? s.cls : L""));
     }
     if (items.empty()) {
-        MessageBoxW(hwnd, L"请先勾选要叫号的学生(可勾选多个)", L"提示", MB_ICONINFORMATION);
+        MessageBoxW(hwnd, L"请先勾选要叫号的学生(可同时勾选多个)", L"提示", MB_ICONINFORMATION);
         return;
     }
+    std::wstring place = TrimW(WinText(g_edPlace));
+    if (place.empty()) place = L"台前";
+    IniSet(L"net", L"place", place);
     std::string callId;
-    std::string payload = BuildCallPayload(items, &callId);
+    std::string payload = BuildCallPayload(place, g_teacherName, items, &callId);
     std::wstring err;
     if (!SendToBoard(payload, err)) {
         MessageBoxW(hwnd, err.c_str(), L"叫号发送失败", MB_ICONWARNING);
@@ -318,7 +629,8 @@ static void OnCall(HWND hwnd) {
         names += name;
         if (!id.empty()) names += L"(" + id + L")";
     }
-    HistAdd(NowTimeW() + L" 叫号 " + std::to_wstring(items.size()) + L" 人: " + names);
+    HistAdd(NowTimeW() + L" 叫号 " + std::to_wstring(items.size()) + L" 人 → " + place +
+            L" [" + g_teacherName + L"]: " + names);
     SetAllChecked(false);
 }
 static void OnClear(HWND hwnd) {
@@ -335,10 +647,10 @@ static void OnBlack(HWND hwnd) {
         MessageBoxW(hwnd, err.c_str(), L"发送失败", MB_ICONWARNING);
         return;
     }
-    HistAdd(NowTimeW() + L" 已发送一键黑屏(大屏居中显示\"保持安静\")");
+    HistAdd(NowTimeW() + L" 已发送一键黑屏");
 }
 
-// ---------------- 扫描 ----------------
+// ---------------- 扫描 / 服务器测试 / 状态 ----------------
 static void DoScan() {
     SetStatus(L"正在扫描局域网中的教室大屏(3秒)…");
     std::vector<BoardInfo> boards;
@@ -356,8 +668,6 @@ static void DoScan() {
         SetStatus(L"未发现教室大屏: 请确认大屏端已启动且同一局域网(也可直接在框中输入大屏IP)");
     }
 }
-
-// ---------------- 服务器测试 ----------------
 static void DoTestServer(HWND hwnd) {
     if (GetRelayBase().empty()) {
         MessageBoxW(hwnd, L"请先在右侧填写服务器地址(如 http://IP:端口/)", L"提示", MB_ICONINFORMATION);
@@ -387,8 +697,6 @@ static void DoTestServer(HWND hwnd) {
     MessageBoxW(hwnd, msg.c_str(), L"测试结果", MB_ICONINFORMATION);
     SetStatus(L"中转服务器测试完成");
 }
-
-// ---------------- 状态 ----------------
 static void UpdateStatus() {
     wchar_t buf[512];
     if (IsRelayMode()) {
@@ -396,13 +704,17 @@ static void UpdateStatus() {
         if (g_presenceSec < 0) on = L"未知";
         else if (g_presenceSec <= 25) on = L"在线";
         else on = L"离线";
-        swprintf(buf, 512, L"模式: 服务器中转 | 大屏: %s | 学生: %d 人", on.c_str(), (int)g_students.size());
+        swprintf(buf, 512, L"模式: 服务器中转 | 大屏: %ls | 学生: %d 人 | 教师: %ls",
+                 on.c_str(), (int)g_students.size(), g_teacherName.c_str());
     } else {
         std::wstring st = (g_sock != INVALID_SOCKET) ? WinText(g_comboBoard) : L"未连接";
-        swprintf(buf, 512, L"模式: 局域网直连 | 教室端: %s | 学生: %d 人", st.c_str(), (int)g_students.size());
+        swprintf(buf, 512, L"模式: 局域网直连 | 教室端: %ls | 学生: %d 人 | 教师: %ls",
+                 st.c_str(), (int)g_students.size(), g_teacherName.c_str());
     }
     SetStatus(buf);
 }
+
+// ---------------- 后台线程 ----------------
 static void PresenceThreadProc() {
     while (!g_stop.load()) {
         if (IsRelayMode()) {
@@ -417,6 +729,47 @@ static void PresenceThreadProc() {
             }
         }
         Sleep(6000);
+    }
+}
+static void LanRecvThreadProc() {
+    while (!g_stop.load()) {
+        if (!IsRelayMode() && g_sock != INVALID_SOCKET) {
+            bool ok = false;
+            std::string f = TcpRecvFrame(g_sock, 30000, &ok);
+            if (!ok) {
+                CloseLan();
+                continue;
+            }
+            PostMessageW(g_hwnd, WM_APP_CHAT, 0, (LPARAM)new std::string(f));
+        } else {
+            Sleep(400);
+        }
+    }
+}
+static void ChatFetchThreadProc() {
+    while (!g_stop.load()) {
+        if (IsRelayMode() && !GetRelayBase().empty()) {
+            std::wstring room = GetRoom();
+            if (!room.empty()) {
+                std::string resp, hdr;
+                std::wstring err;
+                std::wstring url = GetRelayBase() + L"fetch.php?room=" + U8W(UrlEncode(WU8(room))) +
+                                   L"&after=" + std::to_wstring(InterlockedCompareExchange(&g_chatSeq, 0, 0));
+                if (HttpGet(url, resp, err, 32, &hdr)) {
+                    long long seq = HttpSeqFromHeader(hdr);
+                    if (seq > 0) InterlockedExchange(&g_chatSeq, (LONG)seq);
+                    std::vector<std::string> frames;
+                    ParseFrames(resp, frames);
+                    for (auto& fr : frames) {
+                        std::vector<std::string> lines = SplitLines(fr);
+                        if (!lines.empty() && lines[0] == "CHAT")
+                            PostMessageW(g_hwnd, WM_APP_CHAT, 0, (LPARAM)new std::string(fr));
+                    }
+                }
+            }
+        } else {
+            Sleep(2000);
+        }
     }
 }
 
@@ -475,7 +828,7 @@ static void DrawFluentButton(HDC dc, const RECT& rc, const wchar_t* text,
     Graphics g(dc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     {
-        SolidBrush bg(FluentColor(C_BG));   // 圆角以外的角落铺上窗口背景色
+        SolidBrush bg(FluentColor(C_BG));
         g.FillRectangle(&bg, (INT)rc.left, (INT)rc.top,
                         (INT)(rc.right - rc.left), (INT)(rc.bottom - rc.top));
     }
@@ -512,15 +865,20 @@ static void Layout() {
     int M = S(14);
     int y = S(14), h1 = S(34);
     MoveCtl(IDC_BTN_IMPORT, M, y, S(108), h1);
-    MoveCtl(IDC_BTN_SELALL, M + S(116), y, S(62), h1);
-    MoveCtl(IDC_BTN_SELNONE, M + S(186), y, S(74), h1);
-    MoveCtl(IDC_BTN_INVERT, M + S(268), y, S(62), h1);
-    MoveCtl(IDC_BTN_DEL, M + S(338), y, S(88), h1);
+    MoveCtl(IDC_BTN_MANUAL, M + S(116), y, S(92), h1);
+    MoveCtl(IDC_BTN_SELALL, M + S(216), y, S(62), h1);
+    MoveCtl(IDC_BTN_SELNONE, M + S(286), y, S(74), h1);
+    MoveCtl(IDC_BTN_INVERT, M + S(368), y, S(62), h1);
+    MoveCtl(IDC_BTN_DEL, M + S(438), y, S(88), h1);
+    MoveCtl(IDC_BTN_CHAT, M + S(534), y, S(70), h1);
 
     int y2 = y + h1 + S(10), h2 = S(44);
     MoveCtl(IDC_BTN_CALL, M, y2, S(138), h2);
     MoveCtl(IDC_BTN_CLEAR, M + S(146), y2, S(106), h2);
     MoveCtl(IDC_BTN_BLACK, M + S(260), y2, S(106), h2);
+    MoveCtl(IDC_CK_CLS, M + S(376), y2 + S(10), S(150), S(24));
+    MoveCtl(IDC_LBL_PLACE, M + S(532), y2 + S(12), S(44), S(20));
+    MoveCtl(IDC_ED_PLACE, M + S(576), y2 + S(9), S(170), S(26));
 
     int mainTop = y2 + h2 + S(16);
     int mainBottom = rc.bottom - S(34) - S(8);
@@ -535,14 +893,12 @@ static void Layout() {
     MoveCtl(IDC_LBL_NET, panelX, cY + S(2), panelW, S(22));
     MoveCtl(IDC_RB_LAN, panelX + S(6), cY + S(28), S(130), S(24));
     MoveCtl(IDC_RB_RELAY, panelX + S(6), cY + S(54), S(210), S(24));
-    // 局域网行(仅局域网模式显示)
     ShowCtl(IDC_COMBO_BOARD, !relay);
     ShowCtl(IDC_BTN_SCAN, !relay);
     if (!relay) {
         MoveCtl(IDC_COMBO_BOARD, panelX + S(6), cY + S(86), panelW - S(6) - S(10) - S(86), S(26));
         MoveCtl(IDC_BTN_SCAN, panelX + panelW - S(90), cY + S(85), S(84), S(28));
     }
-    // 中转行(仅中转模式显示)
     ShowCtl(IDC_LBL_BASE, relay);
     ShowCtl(IDC_ED_BASE, relay);
     ShowCtl(IDC_LBL_ROOM, relay);
@@ -579,9 +935,10 @@ static void CreateControls(HWND hwnd) {
 
     struct BtnDef { const wchar_t* text; INT_PTR id; };
     static const BtnDef btns[] = {
-        { L"导入Excel", IDC_BTN_IMPORT }, { L"全选", IDC_BTN_SELALL },
-        { L"全不选", IDC_BTN_SELNONE }, { L"反选", IDC_BTN_INVERT },
-        { L"删除选中", IDC_BTN_DEL }, { L"叫 号", IDC_BTN_CALL },
+        { L"导入Excel", IDC_BTN_IMPORT }, { L"手动添加", IDC_BTN_MANUAL },
+        { L"全选", IDC_BTN_SELALL }, { L"全不选", IDC_BTN_SELNONE },
+        { L"反选", IDC_BTN_INVERT }, { L"删除选中", IDC_BTN_DEL },
+        { L"对话", IDC_BTN_CHAT }, { L"叫 号", IDC_BTN_CALL },
         { L"发送清屏", IDC_BTN_CLEAR }, { L"一键黑屏", IDC_BTN_BLACK },
         { L"扫描教室", IDC_BTN_SCAN }, { L"测试连接", IDC_BTN_TEST }
     };
@@ -592,7 +949,6 @@ static void CreateControls(HWND hwnd) {
         SubmitButton(h);
         AddCtl(h);
         if (b.id == IDC_BTN_CALL) g_btnCall = h;
-        if (b.id == IDC_BTN_BLACK) g_btnBlack = h;
         if (b.id == IDC_BTN_SCAN) g_btnScan = h;
         if (b.id == IDC_BTN_TEST) g_btnTest = h;
     }
@@ -626,8 +982,18 @@ static void CreateControls(HWND hwnd) {
     };
     g_lblNet = mkLbl(L"网络连接", IDC_LBL_NET, true);
     g_lblHisty = mkLbl(L"叫号历史", IDC_LBL_HISTY, true);
-    g_lblBase = mkLbl(L"服务器地址 (例: http://IP:端口/)", IDC_LBL_BASE, false);
+    g_lblBase = mkLbl(L"服务器地址 (例: http://IP:host/)", IDC_LBL_BASE, false);
     g_lblRoom = mkLbl(L"房间号(与大屏端一致)", IDC_LBL_ROOM, false);
+    g_lblPlace = mkLbl(L"地点:", IDC_LBL_PLACE, false);
+
+    g_edPlace = CreateWindowExW(0, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                0, 0, 10, 10, hwnd, (HMENU)IDC_ED_PLACE, g_hInst, nullptr);
+    AddCtl(g_edPlace);
+    g_ckCls = CreateWindowExW(0, L"BUTTON", L"大屏显示班级/备注",
+                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                              0, 0, 10, 10, hwnd, (HMENU)IDC_CK_CLS, g_hInst, nullptr);
+    AddCtl(g_ckCls);
 
     g_hist = CreateWindowExW(0, L"LISTBOX", L"",
                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
@@ -642,6 +1008,9 @@ static void CreateControls(HWND hwnd) {
     std::wstring base = IniGet(L"net", L"relay_base", EC_DEFAULT_RELAY);
     SetWindowTextW(g_edBase, base.c_str());
     SetWindowTextW(g_edRoom, IniGet(L"net", L"room", L"101").c_str());
+    SetWindowTextW(g_edPlace, IniGet(L"net", L"place", L"台前").c_str());
+    SendMessageW(g_ckCls, BM_SETCHECK,
+                 IniGet(L"net", L"show_cls", L"1") == L"1" ? BST_CHECKED : BST_UNCHECKED, 0);
     std::wstring host = IniGet(L"net", L"lan_host", L"");
     if (!host.empty()) {
         SendMessageW(g_comboBoard, CB_ADDSTRING, 0, (LPARAM)host.c_str());
@@ -662,8 +1031,6 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC dc = GetDC(nullptr);
         g_dpi = g_forceDpi > 0 ? g_forceDpi : GetDeviceCaps(dc, LOGPIXELSY);
         ReleaseDC(nullptr, dc);
-        const wchar_t* ed = _wgetenv(L"EC_FORCE_DPI");
-        if (ed && _wtoi(ed) > 0) g_dpi = _wtoi(ed);   // 开发验证用: 强制 DPI
         g_fontUi = CreateFontW(-MulDiv(10, g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
@@ -676,6 +1043,7 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateControls(hwnd);
         LoadStudents();
         RefreshListView();
+        ChatLoad();
         Layout();
         SetTimer(hwnd, 1, 1000, nullptr);
         SetTimer(hwnd, 2, 10000, nullptr);
@@ -693,8 +1061,19 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_ERASEBKGND:
-        return 1;   // 背景统一在 WM_PAINT 绘制
-    case WM_PRINT: {   // 供自截图/其他捕获使用
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_PRINT: {
         HDC dc = (HDC)wp;
         RECT rc;
         GetClientRect(hwnd, &rc);
@@ -706,7 +1085,7 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Ctx ctx;
             ctx.dc = dc;
             POINT cOrg = { 0, 0 };
-            MapWindowPoints(hwnd, nullptr, &cOrg, 1);   // 客户端原点(屏幕坐标)
+            MapWindowPoints(hwnd, nullptr, &cOrg, 1);
             ctx.org = cOrg;
             EnumChildWindows(hwnd, [](HWND c, LPARAM l) -> BOOL {
                 Ctx* p = (Ctx*)l;
@@ -714,11 +1093,11 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 GetWindowRect(c, &cr);
                 int ox = cr.left - p->org.x;
                 int oy = cr.top - p->org.y;
-                // 自绘按钮: 直接绘制(避免 comctl 主题在 WM_PRINT 时覆盖自绘效果)
                 int cid = GetDlgCtrlID(c);
-                bool isFluent = cid == IDC_BTN_IMPORT || cid == IDC_BTN_SELALL ||
-                                cid == IDC_BTN_SELNONE || cid == IDC_BTN_INVERT ||
-                                cid == IDC_BTN_DEL || cid == IDC_BTN_CALL ||
+                bool isFluent = cid == IDC_BTN_IMPORT || cid == IDC_BTN_MANUAL ||
+                                cid == IDC_BTN_SELALL || cid == IDC_BTN_SELNONE ||
+                                cid == IDC_BTN_INVERT || cid == IDC_BTN_DEL ||
+                                cid == IDC_BTN_CHAT || cid == IDC_BTN_CALL ||
                                 cid == IDC_BTN_CLEAR || cid == IDC_BTN_BLACK ||
                                 cid == IDC_BTN_SCAN || cid == IDC_BTN_TEST;
                 if (isFluent) {
@@ -737,17 +1116,6 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return TRUE;
             }, (LPARAM)&ctx);
         }
-        return 0;
-    }
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        HBRUSH br = CreateSolidBrush(C_BG);
-        FillRect(dc, &rc, br);
-        DeleteObject(br);
-        EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_DRAWITEM: {
@@ -787,14 +1155,23 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+    case WM_APP_CHAT: {
+        std::unique_ptr<std::string> f((std::string*)lp);
+        OnChatFrame(*f);
+        return 0;
+    }
     case WM_COMMAND: {
         int id = LOWORD(wp);
         int code = HIWORD(wp);
         if (id == IDC_COMBO_BOARD && code == CBN_EDITCHANGE)
             IniSet(L"net", L"lan_host", WinText(g_comboBoard));
-        if (code != BN_CLICKED && code != CBN_EDITCHANGE) break;
+        if (id == IDC_ED_PLACE && code == EN_CHANGE)
+            IniSet(L"net", L"place", TrimW(WinText(g_edPlace)));
+        if (code != BN_CLICKED && code != CBN_EDITCHANGE && code != EN_CHANGE) break;
         switch (id) {
         case IDC_BTN_IMPORT: DoImport(hwnd); break;
+        case IDC_BTN_MANUAL: ShowAddDialog(); break;
+        case IDC_BTN_CHAT: EnsureChatWindow(); break;
         case IDC_BTN_SELALL: SetAllChecked(true); break;
         case IDC_BTN_SELNONE: SetAllChecked(false); break;
         case IDC_BTN_INVERT: InvertChecked(); break;
@@ -814,12 +1191,18 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_BLACK: OnBlack(hwnd); break;
         case IDC_BTN_SCAN: DoScan(); break;
         case IDC_BTN_TEST: DoTestServer(hwnd); break;
+        case IDC_CK_CLS:
+            IniSet(L"net", L"show_cls",
+                   SendMessageW(g_ckCls, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0");
+            g_showCls = (SendMessageW(g_ckCls, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            break;
         case IDC_RB_LAN:
         case IDC_RB_RELAY:
             IniSet(L"net", L"mode", IsRelayMode() ? L"relay" : L"lan");
             if (IsRelayMode()) CloseLan();
             InterlockedExchange(&g_presenceSec, -1);
-            Layout();   // 重新布局以显示/隐藏对应控件
+            InterlockedExchange(&g_chatSeq, 0);
+            Layout();
             UpdateStatus();
             break;
         }
@@ -830,10 +1213,15 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CloseLan();
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
+        HttpAbortCurrent();
         if (g_presenceThread.joinable()) g_presenceThread.join();
+        if (g_lanRecvThread.joinable()) g_lanRecvThread.join();
+        if (g_chatFetchThread.joinable()) g_chatFetchThread.join();
         IniSet(L"net", L"relay_base", GetRelayBase());
         IniSet(L"net", L"room", GetRoom());
+        IniSet(L"net", L"place", TrimW(WinText(g_edPlace)));
         SaveStudents();
+        ChatWipe();   // 关闭教师端后清空上一次对话
         PostQuitMessage(0);
         return 0;
     }
@@ -847,12 +1235,12 @@ static void EnableRoundedCorners(HWND h) {
     typedef HRESULT(WINAPI* Fn)(HWND, DWORD, LPCVOID, DWORD);
     Fn f = (Fn)GetProcAddress(d, "DwmSetWindowAttribute");
     if (f) {
-        int pref = 2;   // DWMWCP_ROUND
+        int pref = 2;
         f(h, 33, &pref, sizeof pref);
     }
 }
 
-// 隐藏调试功能: --ui=<png路径> 启动1.5秒后自截图并退出 (便于开发验证界面)
+// 隐藏调试功能: --ui=<png路径> 启动1.5秒后自截图并退出
 static void DoUiSnap() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
@@ -878,26 +1266,6 @@ static void DoUiSnap() {
         DeleteDC(memdc);
     }
     if (bmp) DeleteObject(bmp);
-    HANDLE lg = CreateFileW((ExeDirW() + L"uisnap.log").c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (lg != INVALID_HANDLE_VALUE) {
-        std::string msg = "ok=" + std::to_string((int)ok) + " bits=" + std::to_string((int)(bits != nullptr)) +
-                          " dpi=" + std::to_string(g_dpi) + "\n";
-        auto dump = [&](const wchar_t* name, HWND c) {
-            RECT r;
-            GetWindowRect(c, &r);
-            msg += std::string("  ") + WU8(name) + "=(" + std::to_string(r.left) + "," +
-                   std::to_string(r.top) + "," + std::to_string(r.right) + "," + std::to_string(r.bottom) + ")\n";
-        };
-        dump(L"hist", g_hist);
-        dump(L"status", g_status);
-        dump(L"lv", g_lv);
-        dump(L"callBtn", g_btnCall);
-        msg += std::string("  callCid=") + std::to_string(GetDlgCtrlID(g_btnCall)) + "\n";
-        DWORD w = 0;
-        WriteFile(lg, msg.data(), (DWORD)msg.size(), &w, nullptr);
-        CloseHandle(lg);
-    }
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
@@ -906,9 +1274,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     size_t p = cmd.find(L"--ui=");
     if (p != std::wstring::npos) {
         g_uiSnapPath = cmd.substr(p + 5);
-        g_forceDpi = 96;   // 调试截图使用标准 DPI, 保证与真实设备一致
+        g_forceDpi = 96;
     }
     SetProcessDPIAware();
+    {
+        HDC ddc = GetDC(nullptr);
+        g_dpi = g_forceDpi > 0 ? g_forceDpi : GetDeviceCaps(ddc, LOGPIXELSY);
+        ReleaseDC(nullptr, ddc);
+    }
     EcNetStart();
     INITCOMMONCONTROLSEX ice;
     ice.dwSize = sizeof ice;
@@ -917,6 +1290,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     GdiplusStartupInput gsi;
     ULONG_PTR gdiToken = 0;
     GdiplusStartup(&gdiToken, &gsi, nullptr);
+
+    g_teacherName = IniGet(L"net", L"teacher_name", L"教师");
+    g_showCls = IniGet(L"net", L"show_cls", L"1") != L"0";
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof wc);
@@ -928,17 +1304,79 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.lpszClassName = L"EasyCallTeacherWnd";
     RegisterClassW(&wc);
 
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = ChatProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"EasyCallChatWnd";
+    RegisterClassW(&wc);
+
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = NameDlgProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"EasyCallNameDlg";
+    RegisterClassW(&wc);
+
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = AddDlgProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"EasyCallAddDlg";
+    RegisterClassW(&wc);
+
     HWND hwnd = CreateWindowExW(0, L"EasyCallTeacherWnd", L"EasyCall 班级叫号系统 - 教师端",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, S(1150), S(720),
                                 nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
     EnableRoundedCorners(hwnd);
+    // 主窗口先显示, 教师名弹窗盖在其上(owned); 任何情况下教师端都能打开
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
 
+    if (g_uiSnapPath.empty()) {
+        RECT mrc;
+        GetWindowRect(hwnd, &mrc);
+        HWND ndlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"EasyCallNameDlg", L"进入 EasyCall - 教师端",
+                                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                    mrc.left + (mrc.right - mrc.left) / 2 - S(170),
+                                    mrc.top + (mrc.bottom - mrc.top) / 2 - S(100),
+                                    S(340), S(190), hwnd, nullptr, hInst, nullptr);
+        if (ndlg) {
+            EnableWindow(hwnd, FALSE);
+            MSG nm;
+            while (IsWindow(ndlg)) {
+                BOOL got = GetMessageW(&nm, nullptr, 0, 0);
+                if (got <= 0) {
+                    if (got == 0) PostQuitMessage((int)nm.wParam);
+                    break;
+                }
+                TranslateMessage(&nm);
+                DispatchMessageW(&nm);
+            }
+            EnableWindow(hwnd, TRUE);
+            SetForegroundWindow(hwnd);
+        }
+        if (TrimW(g_teacherName).empty()) g_teacherName = L"教师";
+        IniSet(L"net", L"teacher_name", g_teacherName);
+    } else {
+        g_teacherName = L"测试教师";
+    }
+
+    UpdateWindow(hwnd);
+
     g_stop.store(false);
+    g_chatSender = TeacherSendChat;
     g_presenceThread = std::thread(PresenceThreadProc);
+    g_lanRecvThread = std::thread(LanRecvThreadProc);
+    g_chatFetchThread = std::thread(ChatFetchThreadProc);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
