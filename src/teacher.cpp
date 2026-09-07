@@ -22,6 +22,7 @@ using namespace Gdiplus;
 
 // 自定义消息: 网络线程收到 CHAT 帧后投递到主线程处理
 #define WM_APP_CHAT (WM_APP + 2)
+#define WM_APP_TRAY (WM_APP + 11)   // 托盘图标回调消息(lParam 低字为鼠标事件)
 
 // 学生数据: 学号/姓名/班级(备注)
 struct Student { std::wstring id, name, cls; };
@@ -52,6 +53,28 @@ static const COLORREF C_BTN_P    = RGB(0xE9, 0xE9, 0xE9);   // 普通按钮按�
 static const COLORREF C_TEXT     = RGB(0x1A, 0x1A, 0x1A);   // 主文字色
 static const COLORREF C_TEXT2    = RGB(0x60, 0x5E, 0x5C);   // 次要文字色(静态标签)
 
+// 功能: 次级窗口(对话/弹窗)通用控件上色: kind 0=静态标签 1=编辑框
+// 参数: dc 控件设备上下文; kind 控件种类
+// 返回: 背景画刷(交回系统填充控件背景)
+static LRESULT LightCtlColor(HDC dc, int kind) {
+    if (kind == 0) {                       // 静态标签: 次要色+透明底
+        SetTextColor(dc, C_TEXT2);
+        SetBkMode(dc, TRANSPARENT);
+    } else {                               // 编辑框: 白底深字
+        SetTextColor(dc, C_TEXT);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, C_WHITE);
+    }
+    static HBRUSH brBg = CreateSolidBrush(C_BG);
+    static HBRUSH brEd = CreateSolidBrush(C_WHITE);
+    return (LRESULT)(kind == 1 ? brEd : brBg);
+}
+
+// 前置声明: 自绘按钮绘制/钩子函数(定义在文件后部, 次级窗口先引用)
+static void SubmitButton(HWND h);
+static void DrawFluentButton(HDC dc, const RECT& rc, const wchar_t* text,
+                             bool primary, bool hover, bool pressed, bool disabled, HFONT font);
+
 // ---------------- 全局变量 ----------------
 static HINSTANCE g_hInst;                                       // 应用实例句柄
 static HWND g_hwnd, g_lv, g_hist, g_status;                     // 主窗口/学生列表/历史列表/状态栏
@@ -79,6 +102,10 @@ static std::wstring g_uiSnapPath;   // --ui= 自截图调试功能
 static int g_forceDpi = 0;          // --ui 调试时强制 96 DPI
 static bool (*g_chatSender)(const std::wstring&) = nullptr;   // 对话发送函数指针(TeacherSendChat)
 static void DoUiSnap();
+
+// 托盘相关
+static HICON g_trayIcon = nullptr;          // 托盘图标句柄(退出时 DestroyIcon)
+static NOTIFYICONDATAW g_nid;              // 托盘图标描述结构(NIM_ADD/NIM_DELETE 共用)
 
 // 前置声明(定义在文件后部)
 static bool LanConnect(const std::wstring& hostPort, std::wstring& err);
@@ -247,7 +274,7 @@ static void OnChatFrame(const std::string& frame) {
 // 返回: true=发送成功; false=失败(原因见 errOut)
 static bool SendToBoard(const std::string& payload, std::wstring& errOut) {
     if (IsRelayMode()) {
-        if (GetRelayBase().empty()) { errOut = L"请先填写服务器地址(如 http://IP:端口/)"; return false; }
+        if (GetRelayBase().empty()) { errOut = L"请先填写服务器地址(如 http://IP:host/)"; return false; }
         std::string room = WU8(GetRoom());
         if (room.empty()) { errOut = L"请先填写房间号(与班级大屏端一致)"; return false; }
         std::string body = "room=" + UrlEncode(room) + "&data=" + UrlEncode(payload);
@@ -323,12 +350,16 @@ static LRESULT CALLBACK ChatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         WNDPROC orig = (WNDPROC)GetWindowLongPtrW(g_chatInput, GWLP_WNDPROC);
         SetPropW(g_chatInput, L"EcOrigProc", (HANDLE)orig);
         SetWindowLongPtrW(g_chatInput, GWLP_WNDPROC, (LONG_PTR)ChatInputProc);
-        // [发送]按钮
-        CreateWindowExW(0, L"BUTTON", L"发送",
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_SEND, g_hInst, nullptr);
+        // [发送]按钮(自绘 Fluent 风格)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"发送",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_SEND, g_hInst, nullptr);
+            SubmitButton(b);   // 挂悬停跟踪钩子
+        }
         SendMessageW(g_chatLog, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
         SendMessageW(g_chatInput, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_CHAT_SEND), WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         for (auto& line : g_chatMsgs) ChatLogAppend(line);   // 载入历史对话
         return 0;
     }
@@ -341,6 +372,41 @@ static LRESULT CALLBACK ChatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(g_chatInput, S(8), rc.bottom - hh - S(12), rc.right - S(96), hh, TRUE);
         MoveWindow(GetDlgItem(hwnd, IDC_CHAT_SEND), rc.right - S(80), rc.bottom - hh - S(13), S(72), hh + 2, TRUE);
         return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);   // 统一浅灰背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 复选框等按钮底色
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 编辑框(日志/输入)
+        return LightCtlColor((HDC)wp, 1);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([发送]主题色按钮)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool primary = (GetDlgCtrlID(d->hwndItem) == IDC_CHAT_SEND);
+            DrawFluentButton(d->hDC, d->rcItem, txt, primary,
+                             g_hoverBtn == d->hwndItem,
+                             (d->itemState & ODS_SELECTED) != 0,
+                             (d->itemState & ODS_DISABLED) != 0,
+                             primary ? g_fontBold : g_fontUi);
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_CHAT_SEND) {
@@ -387,23 +453,66 @@ static void EnsureChatWindow(bool focus) {
 static LRESULT CALLBACK NameDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        // 提示标签
-        CreateWindowExW(0, L"STATIC", L"请输入教师姓名(叫号时大屏会显示)",
-                        WS_CHILD | WS_VISIBLE, S(18), S(22), S(280), S(20),
-                        hwnd, nullptr, g_hInst, nullptr);
+        // 提示标签(Fluent: 次要文字色+统一字体)
+        {
+            HWND lbl = CreateWindowExW(0, L"STATIC", L"请输入教师姓名(叫号时大屏会显示)",
+                                       WS_CHILD | WS_VISIBLE, S(18), S(22), S(280), S(20),
+                                       hwnd, nullptr, g_hInst, nullptr);
+            SendMessageW(lbl, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        }
         std::wstring pre = IniGet(L"net", L"teacher_name", L"");   // 上次填过的名字
         g_nameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", pre.c_str(),
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                                      S(18), S(50), S(270), S(26), hwnd, (HMENU)IDC_NAME_EDIT,
                                      g_hInst, nullptr);
-        // [进入叫号]按钮
-        CreateWindowExW(0, L"BUTTON", L"进入叫号",
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        S(80), S(92), S(150), S(34), hwnd, (HMENU)IDC_NAME_OK, g_hInst, nullptr);
+        // [进入叫号]按钮(自绘 Fluent 主题色)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"进入叫号",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(80), S(92), S(150), S(34), hwnd, (HMENU)IDC_NAME_OK,
+                                     g_hInst, nullptr);
+            SubmitButton(b);   // 挂悬停跟踪钩子
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        }
         SendMessageW(g_nameEdit, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
         SetFocus(g_nameEdit);
         SendMessageW(g_nameEdit, EM_SETSEL, 0, -1);   // 预填文字全选, 可直接覆盖输入
         return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);   // 统一浅灰背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 按钮底色(自绘按钮不影响)
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 姓名编辑框: 白底
+        return LightCtlColor((HDC)wp, 1);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([进入叫号]主题色按钮)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool primary = (GetDlgCtrlID(d->hwndItem) == IDC_NAME_OK);
+            DrawFluentButton(d->hDC, d->rcItem, txt, primary,
+                             g_hoverBtn == d->hwndItem,
+                             (d->itemState & ODS_SELECTED) != 0,
+                             (d->itemState & ODS_DISABLED) != 0,
+                             primary ? g_fontBold : g_fontUi);
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_NAME_OK) {
@@ -438,10 +547,11 @@ static LRESULT CALLBACK NameDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        // 便捷 lambda: 建标签
+        // 便捷 lambda: 建标签(Fluent: 次要文字色+统一字体)
         auto mkLbl = [&](const wchar_t* t, int x, int y, int w) {
-            CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE, S(x), S(y), S(w), S(18),
-                            hwnd, nullptr, g_hInst, nullptr);
+            HWND lbl = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE, S(x), S(y), S(w), S(18),
+                                       hwnd, nullptr, g_hInst, nullptr);
+            SendMessageW(lbl, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
         };
         // 便捷 lambda: 建编辑框并设置字体
         auto mkEdit = [&](const wchar_t* t, INT_PTR id, int x, int y) -> HWND {
@@ -457,15 +567,60 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         mkEdit(L"", IDC_ADD_NAME, 70, 48);
         mkLbl(L"班级/备注(可选):", 18, 82, 130);
         mkEdit(L"", IDC_ADD_CLS, 70, 80);
-        // [添加]按钮: 把当前输入加入名单并清空输入框
-        CreateWindowExW(0, L"BUTTON", L"添加",
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                        S(40), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_OK, g_hInst, nullptr);
-        // [完成]按钮: 关闭弹窗
-        CreateWindowExW(0, L"BUTTON", L"完成",
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                        S(170), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_DONE, g_hInst, nullptr);
+        // [添加]按钮: 把当前输入加入名单并清空输入框(自绘 Fluent 主题色)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"添加",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(40), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_OK,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        }
+        // [完成]按钮: 关闭弹窗(自绘 Fluent 普通按钮)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"完成",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(170), S(118), S(100), S(30), hwnd, (HMENU)IDC_ADD_DONE,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        }
         return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);   // 统一浅灰背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 按钮底色(自绘按钮不影响)
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 三个输入编辑框: 白底
+        return LightCtlColor((HDC)wp, 1);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([添加]主题色 / [完成]普通)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool primary = (GetDlgCtrlID(d->hwndItem) == IDC_ADD_OK);
+            DrawFluentButton(d->hDC, d->rcItem, txt, primary,
+                             g_hoverBtn == d->hwndItem,
+                             (d->itemState & ODS_SELECTED) != 0,
+                             (d->itemState & ODS_DISABLED) != 0,
+                             primary ? g_fontBold : g_fontUi);
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
@@ -740,7 +895,7 @@ static void OnCall(HWND hwnd) {
         return;
     }
     std::wstring place = TrimW(WinText(g_edPlace));
-    if (place.empty()) place = L"台前";   // 地点默认"台前"
+    if (place.empty()) place = L"办公室";
     IniSet(L"net", L"place", place);
     std::string callId;
     std::string payload = BuildCallPayload(place, g_teacherName, items, &callId);
@@ -814,7 +969,7 @@ static void DoScan() {
 // 返回: 无
 static void DoTestServer(HWND hwnd) {
     if (GetRelayBase().empty()) {
-        MessageBoxW(hwnd, L"请先在右侧填写服务器地址(如 http://IP:端口/)", L"提示", MB_ICONINFORMATION);
+        MessageBoxW(hwnd, L"请先在右侧填写服务器地址(如 http://IP:host/)", L"提示", MB_ICONINFORMATION);
         return;
     }
     std::wstring room = GetRoom();
@@ -836,7 +991,7 @@ static void DoTestServer(HWND hwnd) {
     std::wstring e2;
     if (HttpGet(GetRelayBase() + L"presence.php?room=" + U8W(UrlEncode(WU8(room))), pr, e2, 6)) {
         long sec = _wtol(U8W(pr).c_str());   // 返回大屏最近心跳距现在秒数
-        msg += sec >= 0 && sec <= 25 ? L"\n教室大屏: 在线" : L"\n教室大屏: 离线(未上报心跳, 请确认大屏端已运行且房间号一致)";
+        msg += sec >= 0 && sec <= 25 ? L"\n教室大屏: 在线" : L"\n教室大屏: 离线(请确认大屏端已运行且房间号一致)";
     }
     MessageBoxW(hwnd, msg.c_str(), L"测试结果", MB_ICONINFORMATION);
     SetStatus(L"中转服务器测试完成");
@@ -1377,6 +1532,46 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         OnChatFrame(*f);
         return 0;
     }
+    case WM_APP_TRAY: {
+        // 托盘回调: 左键=恢复主窗口; 右键=弹出菜单(重启/关闭)
+        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        } else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 1, L"重启应用");
+            AppendMenuW(menu, MF_STRING, 2, L"关闭应用");
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+            int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+                                     pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+            if (cmd == 1) {
+                // 重启: 启动自身新实例后退出本实例
+                std::wstring exe = ExeDirW() + L"EasyCall-Teacher.exe";
+                STARTUPINFOW si;
+                memset(&si, 0, sizeof si);
+                si.cb = sizeof si;
+                PROCESS_INFORMATION pi;
+                memset(&pi, 0, sizeof pi);
+                if (CreateProcessW(nullptr, &exe[0], nullptr, nullptr, FALSE,
+                                   0, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                DestroyWindow(hwnd);
+            } else if (cmd == 2) {
+                DestroyWindow(hwnd);
+            }
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        // 点关闭按钮: 最小化到托盘(隐藏窗口, 不退出进程)
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
     case WM_COMMAND: {
         int id = LOWORD(wp);
         int code = HIWORD(wp);
@@ -1430,7 +1625,9 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY:
-        // 退出清理: 停线程 -> 断连接 -> 停定时器 -> 保存配置与名单 -> 清对话记录
+        // 退出清理: 移除托盘图标 -> 停线程 -> 断连接 -> 停定时器 -> 保存配置与名单 -> 清对话记录
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = nullptr; }
         g_stop.store(true);
         CloseLan();
         KillTimer(hwnd, 1);
@@ -1448,6 +1645,22 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 功能: 注册托盘图标(关闭窗口后驻留后台)
+// 参数: hwnd 接收托盘回调消息的窗口
+// 返回: 无(失败静默, 不影响主功能)
+static void TrayInit(HWND hwnd) {
+    g_trayIcon = MakeTrayIcon(true);   // 教师端图标: 蓝上箭头
+    memset(&g_nid, 0, sizeof g_nid);
+    g_nid.cbSize = sizeof g_nid;
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon = g_trayIcon;
+    wcsncpy(g_nid.szTip, L"EasyCall 教师端", 127);   // MinGW 无 wcsncpy_s, 用标准 wcsncpy
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
 // Win11 圆角窗口(不支持则忽略)
@@ -1559,7 +1772,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 浅灰)
     wc.lpszClassName = L"EasyCallChatWnd";
     RegisterClassW(&wc);
 
@@ -1568,7 +1781,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 浅灰)
     wc.lpszClassName = L"EasyCallNameDlg";
     RegisterClassW(&wc);
 
@@ -1577,7 +1790,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 浅灰)
     wc.lpszClassName = L"EasyCallAddDlg";
     RegisterClassW(&wc);
 
@@ -1590,6 +1803,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     EnableRoundedCorners(hwnd);
     // 主窗口先显示, 教师名弹窗盖在其上(owned); 任何情况下教师端都能打开
     ShowWindow(hwnd, nShow);
+    TrayInit(hwnd);   // 注册托盘图标
     UpdateWindow(hwnd);
 
     // ---- ④ 教师名弹窗(模态等待) ----

@@ -4,6 +4,17 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <winsock2.h>
+
+// ================= WinToast 集成(可选) =================
+// 把 wintoastlib.h / wintoastlib.cpp 放入 src\ 目录后, build.bat 会自动加 -DHAVE_WINTOAST 启用
+// 注意: WinRT/WRL 头必须先于 GDI+ 头包含, 避免 Color/byte 等符号冲突
+#ifdef HAVE_WINTOAST
+#include "wintoastlib.h"
+#include <shlobj.h>
+#include <propsys.h>
+#include <objbase.h>
+#endif
+
 // MinGW 旧版 gdiplus 头文件缺少 PROPID 定义, 先补上
 typedef ULONG PROPID;
 #include <gdiplus.h>
@@ -25,6 +36,21 @@ using namespace Gdiplus;
 #define WM_APP_STATUS  (WM_APP + 3)   // 网络状态变化(wp=1在线, 0离线; lp=新状态文本)
 #define WM_APP_BLACK   (WM_APP + 4)   // 收到黑屏指令
 #define WM_APP_CHAT    (WM_APP + 5)   // 收到对话消息
+#define WM_APP_TRAY    (WM_APP + 11)  // 托盘图标回调消息(lParam 低字为鼠标事件)
+
+// ---------------- 次级窗口 Fluent 配色(暗色) ----------------
+// 设置对话框/对话窗口统一暗色主题, 与大屏深蓝底一致
+static const COLORREF C_DBG    = RGB(13, 27, 48);      // 次级窗口底色(与大屏一致)
+static const COLORREF C_DEDIT  = RGB(26, 38, 58);      // 编辑框底色
+static const COLORREF C_DLIST  = RGB(23, 33, 50);      // 下拉列表底色
+static const COLORREF C_DTEXT  = RGB(0xEA, 0xEA, 0xEA);   // 输入文字色
+static const COLORREF C_DTEXT2 = RGB(0xC9, 0xD6, 0xE3);   // 标签文字色
+
+// 前置声明: 自绘按钮绘制/钩子函数(定义在文件后部, 对话窗口先引用)
+static void SubmitButton(HWND h);
+static void DrawDarkButton(HDC dc, const RECT& rc, const wchar_t* text,
+                           bool hover, bool pressed, HFONT font);
+static HFONT MakeFont(int pt, int weight);
 
 // 单个被叫学生: 学号/姓名/班级
 struct CallItem { std::wstring id, name, cls; };
@@ -34,6 +60,7 @@ struct QCall { std::wstring place, teacher; std::vector<CallItem> items; };
 // 全部控件 ID(枚举, 无符号整型)
 enum : INT_PTR { IDC_BTN_SETTINGS = 100, IDC_BTN_BLACK, IDC_BTN_CHAT, IDC_BTN_CLEAR,
        IDC_ED_MODE, IDC_ED_BASE, IDC_ED_ROOM, IDC_ED_PORT, IDC_ED_TITLE,   // 设置对话框控件
+       IDC_CK_AUTOSTART,                                                    // 开机自启动复选框
        IDC_BTN_OK, IDC_BTN_CANCEL,
        IDC_CHAT_LOG = 200, IDC_CHAT_INPUT, IDC_CHAT_SEND };                // 对话窗口控件
 
@@ -60,6 +87,8 @@ static bool g_black = false;                      // 是否黑屏(显示"保持�
 static bool g_callHidden = false;   // 本机一键清屏: 仅隐藏当前叫号显示, 不清除队列
 static int g_flash = 0;                            // 闪烁剩余次数(新叫号时背景闪几下)
 static std::atomic<bool> g_stop{false};            // 后台线程退出标志
+static HICON g_trayIcon = nullptr;                 // 托盘图标句柄(运行时绘制)
+static NOTIFYICONDATAW g_nid{};                    // 托盘图标数据结构
 static SOCKET g_listen = INVALID_SOCKET;           // 局域网监听套接字
 static SOCKET g_client = INVALID_SOCKET;           // 当前教师端连接
 static std::thread g_threadNet, g_threadBroad, g_threadPresence;   // 网络主线程/UDP广播线程/心跳线程
@@ -71,6 +100,7 @@ static bool (*g_chatSender)(const std::wstring&) = nullptr;   // 对话发送函
 static void DoUiSnap();
 static void HandlePayload(const std::string& payload, bool fromTcp, SOCKET replySock);
 static void EnsureChatWindow(bool focus = true);
+static bool AutoStartSet(bool enable);   // 注册/注销开机自启动(定义见后文)
 
 // 功能: DPI 缩放: 设计稿 96DPI 下的像素值 -> 当前 DPI 下的实际像素
 // 参数: px 设计稿像素值
@@ -84,6 +114,23 @@ static HFONT MakeFont(int pt, int weight) {
     return CreateFontW(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, 0, 0, 0,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+}
+// 功能: 次级窗口(设置/对话)通用控件上色: kind 0=静态标签 1=编辑框 2=下拉列表
+// 参数: dc 控件设备上下文; kind 控件种类
+// 返回: 背景画刷(交回系统填充控件背景)
+static LRESULT DarkCtlColor(HDC dc, int kind) {
+    if (kind == 0) {                       // 静态标签: 次要色+透明底
+        SetTextColor(dc, C_DTEXT2);
+        SetBkMode(dc, TRANSPARENT);
+    } else {                               // 编辑框/下拉列表: 深底浅字
+        SetTextColor(dc, C_DTEXT);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, kind == 1 ? C_DEDIT : C_DLIST);
+    }
+    static HBRUSH brBg = CreateSolidBrush(C_DBG);
+    static HBRUSH brEd = CreateSolidBrush(C_DEDIT);
+    static HBRUSH brLs = CreateSolidBrush(C_DLIST);
+    return (LRESULT)(kind == 0 ? brBg : kind == 1 ? brEd : brLs);
 }
 // 功能: 更新状态文字与在线标志(网络线程通过 WM_APP_STATUS 调用)
 // 参数: t 状态文字; online 是否在线(影响顶部状态点颜色)
@@ -271,15 +318,16 @@ static LRESULT CALLBACK ChatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         WNDPROC orig = (WNDPROC)GetWindowLongPtrW(g_chatInput, GWLP_WNDPROC);
         SetPropW(g_chatInput, L"EcOrigProc", (HANDLE)orig);
         SetWindowLongPtrW(g_chatInput, GWLP_WNDPROC, (LONG_PTR)ChatInputProc);
-        // [发送]按钮
-        CreateWindowExW(0, L"BUTTON", L"发送",
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_SEND, g_hInst, nullptr);
+        // [发送]按钮(自绘 Fluent 暗色风格)
         {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"发送",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     0, 0, 10, 10, hwnd, (HMENU)IDC_CHAT_SEND, g_hInst, nullptr);
+            SubmitButton(b);   // 挂悬停跟踪钩子
             HFONT f = MakeFont(11, FW_NORMAL);
             SendMessageW(g_chatLog, WM_SETFONT, (WPARAM)f, TRUE);
             SendMessageW(g_chatInput, WM_SETFONT, (WPARAM)f, TRUE);
-            SendMessageW(GetDlgItem(hwnd, IDC_CHAT_SEND), WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(b, WM_SETFONT, (WPARAM)f, TRUE);
         }
         for (auto& line : g_chatMsgs) ChatLogAppend(line);   // 载入历史对话
         return 0;
@@ -293,6 +341,42 @@ static LRESULT CALLBACK ChatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(g_chatInput, S(8), rc.bottom - hh - S(12), rc.right - S(96), hh, TRUE);
         MoveWindow(GetDlgItem(hwnd, IDC_CHAT_SEND), rc.right - S(80), rc.bottom - hh - S(13), S(72), hh + 2, TRUE);
         return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_DBG);   // 统一深蓝背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签
+        return DarkCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 按钮底色(自绘按钮不影响)
+        return DarkCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 日志/输入编辑框: 深底浅字
+        return DarkCtlColor((HDC)wp, 1);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([发送]按钮, 固定深蓝底不受黑屏状态影响)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool ob = g_black;
+            g_black = false;
+            DrawDarkButton(d->hDC, d->rcItem, txt,
+                           g_hoverBtn == d->hwndItem,
+                           (d->itemState & ODS_SELECTED) != 0,
+                           MakeFont(11, FW_NORMAL));
+            g_black = ob;
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_CHAT_SEND) {
@@ -778,8 +862,9 @@ static void DlgLayout() {
     move(IDC_ED_ROOM, y + S(22), S(24)); y += S(54);    // 房间号
     move(IDC_ED_PORT, y + S(22), S(24)); y += S(54);    // 端口
     move(IDC_ED_TITLE, y + S(22), S(24)); y += S(54);   // 标题
-    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_OK), x, y + S(8), S(120), S(32), TRUE);      // [保存]
-    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_CANCEL), x + S(160), y + S(8), S(120), S(32), TRUE);   // [取消]
+    MoveWindow(GetDlgItem(g_dlg, IDC_CK_AUTOSTART), x, S(278), w, S(22), TRUE);   // 自启动开关
+    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_OK), x, S(304), S(120), S(32), TRUE);      // [保存]
+    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_CANCEL), x + S(160), S(304), S(120), S(32), TRUE);   // [取消]
 }
 // 功能: 设置对话框过程: 编辑模式/服务器/房间/端口/标题, [保存]写 INI
 // 参数: hwnd 窗口句柄; msg 消息; wp/lp 消息参数
@@ -788,14 +873,17 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_dlg = hwnd;
-        auto mkLabel = [&](const wchar_t* t, int yy) {   // 便捷 lambda: 建标签
-            CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE, S(16), yy, S(300), S(20),
-                            hwnd, nullptr, g_hInst, nullptr);
+        auto mkLabel = [&](const wchar_t* t, int yy) {   // 便捷 lambda: 建标签(Fluent 次要色+统一字体)
+            HWND lbl = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE, S(16), yy, S(300), S(20),
+                                       hwnd, nullptr, g_hInst, nullptr);
+            SendMessageW(lbl, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
         };
         auto mkEdit = [&](const wchar_t* t, INT_PTR id, DWORD style, int yy, int hh) {   // 建编辑框
-            return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", t,
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | style,
-                                   S(16), yy, S(300), hh, hwnd, (HMENU)id, g_hInst, nullptr);
+            HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", t,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | style,
+                                     S(16), yy, S(300), hh, hwnd, (HMENU)id, g_hInst, nullptr);
+            SendMessageW(e, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
+            return e;
         };
         mkLabel(L"运行模式:", S(18));
         // 模式下拉框(两项, 不可编辑)
@@ -803,6 +891,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
                                     S(16), S(38), S(300), S(300), hwnd,
                                     (HMENU)IDC_ED_MODE, g_hInst, nullptr);
+        SendMessageW(g_dlgMode, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);   // 统一字体
         SendMessageW(g_dlgMode, CB_ADDSTRING, 0, (LPARAM)L"局域网直连(同一网络)");
         SendMessageW(g_dlgMode, CB_ADDSTRING, 0, (LPARAM)L"服务器中转(跨网络)");
         SendMessageW(g_dlgMode, CB_SETCURSEL, g_mode == L"relay" ? 1 : 0, 0);   // 回显当前模式
@@ -814,13 +903,73 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_dlgPort = mkEdit(std::to_wstring(g_port).c_str(), IDC_ED_PORT, ES_AUTOHSCROLL | ES_NUMBER, S(196), S(24));
         mkLabel(L"大屏标题:", S(228));
         g_dlgTitle = mkEdit(g_title.c_str(), IDC_ED_TITLE, ES_AUTOHSCROLL, S(250), S(24));
-        // [保存]/[取消]按钮
-        CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        S(16), S(292), S(120), S(32), hwnd, (HMENU)IDC_BTN_OK, g_hInst, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                        S(176), S(292), S(120), S(32), hwnd, (HMENU)IDC_BTN_CANCEL, g_hInst, nullptr);
+        // 开机自启动开关(回显当前设置)
+        {
+            HWND ck = CreateWindowExW(0, L"BUTTON", L"开机自动启动(大屏)",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                      S(16), S(278), S(300), S(22), hwnd,
+                                      (HMENU)IDC_CK_AUTOSTART, g_hInst, nullptr);
+            SendMessageW(ck, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
+            SendMessageW(ck, BM_SETCHECK,
+                         IniGet(L"board", L"autostart", L"1") == L"1" ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+        // [保存]/[取消]按钮(自绘 Fluent 暗色风格)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"保存",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(16), S(304), S(120), S(32), hwnd, (HMENU)IDC_BTN_OK,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
+        }
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"取消",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(176), S(304), S(120), S(32), hwnd, (HMENU)IDC_BTN_CANCEL,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
+        }
         DlgLayout();
         return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_DBG);   // 统一深蓝背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签(含下拉框静态区)
+        return DarkCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 复选框底色(自绘按钮不影响)
+        return DarkCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 各编辑框: 深底浅字
+        return DarkCtlColor((HDC)wp, 1);
+    case WM_CTLCOLORLISTBOX:  // 下拉列表: 深底浅字
+        return DarkCtlColor((HDC)wp, 2);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([保存]/[取消], 固定深蓝底不受黑屏状态影响)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool ob = g_black;
+            g_black = false;
+            DrawDarkButton(d->hDC, d->rcItem, txt,
+                           g_hoverBtn == d->hwndItem,
+                           (d->itemState & ODS_SELECTED) != 0,
+                           MakeFont(11, FW_NORMAL));
+            g_black = ob;
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_BTN_OK) {
@@ -843,6 +992,12 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             IniSet(L"board", L"room", room);
             IniSet(L"board", L"port", std::to_wstring(prt));
             IniSet(L"board", L"title", title);
+            // 自启动开关: 写 INI + 立即同步注册表
+            {
+                bool as = SendMessageW(GetDlgItem(hwnd, IDC_CK_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                IniSet(L"board", L"autostart", as ? L"1" : L"0");
+                AutoStartSet(as);
+            }
             MessageBoxW(hwnd, L"设置已保存, 重启程序后生效", L"提示", MB_ICONINFORMATION);
             DestroyWindow(hwnd);
             return 0;
@@ -887,6 +1042,87 @@ static void ShowSettings() {
     }
 }
 
+// 功能: 注册/注销开机自启动项(HKCU\...\Run\EasyCallBoard, 当前用户级别无需管理员权限)
+// 参数: enable true=写入注册表(路径随 exe 当前位置自动更新); false=删除注册表项
+// 返回: true=操作成功; false=打开注册表键失败
+static bool AutoStartSet(bool enable) {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return false;
+    if (enable) {
+        std::wstring cmd = L"\"" + ExeDirW() + L"EasyCall-Board.exe\"";   // 带引号完整路径
+        RegSetValueExW(k, L"EasyCallBoard", 0, REG_SZ,
+                       (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, L"EasyCallBoard");
+    }
+    RegCloseKey(k);
+    return true;
+}
+
+// ================= WinToast 辅助函数(未启用库时为空实现) =================
+#ifdef HAVE_WINTOAST
+// 功能: 初始化 WinToast: 设置应用名与 AUMID 后调用 initialize
+// 说明: v1.3.2 的 initialize() 内部会自动创建开始菜单快捷方式并管理 COM,
+//       这里绝不能自行 CoInitialize/CoUninitialize(会拆掉库的 COM 导致通知失败)
+// 返回: 无(初始化失败时在状态栏提示)
+static void WinToastInit() {
+    using namespace WinToastLib;
+    WinToast::instance()->setAppName(L"EasyCall 班级大屏");
+    WinToast::instance()->setAppUserModelId(
+        WinToast::configureAUMI(L"QuintinZong", L"EasyCall", L"Board"));
+    WinToast::WinToastError err = WinToast::WinToastError::NoError;
+    if (!WinToast::instance()->initialize(&err)) {
+        PostMessageW(g_hwnd, WM_APP_STATUS, 0,
+                     (LPARAM)new std::wstring(L"通知初始化失败(错误码 " +
+                                              std::to_wstring((int)err) + L")"));
+    }
+}
+// 功能: 通知事件回调(点击/关闭/失败等动作本系统无需处理, 全部空实现)
+// 说明: v1.3.2 的 showToast 要求处理器非空, 且必须为全局实例(库在通知存活期内引用它)
+class BoardToastHandler : public WinToastLib::IWinToastHandler {
+public:
+    void toastActivated() const override {}
+    void toastActivated(int actionIndex) const override {}
+    void toastActivated(std::wstring response) const override {}
+    void toastDismissed(WinToastLib::IWinToastHandler::WinToastDismissalReason state) const override {}
+    void toastFailed() const override {}
+};
+static BoardToastHandler g_toastHandler;   // 全局单例, 生命周期覆盖全部通知
+
+// 功能: 弹出叫号通知(标题+人名); 先隐藏上一次通知再显示本次
+// 参数: q 本次叫号(地点/教师/学生列表)
+// 返回: 无
+static INT64 g_lastToastId = -1;   // 上一次通知的 ID(下次弹通知前先清掉)
+static void ToastCall(const QCall& q) {
+    using namespace WinToastLib;
+    std::wstring head = L"请以下同学到" + q.place + L"集合 (" + q.teacher + L")";
+    std::wstring names;
+    for (auto& it : q.items) {
+        if (!names.empty()) names += L"、";
+        names += it.name;
+    }
+    WinToastTemplate t(WinToastTemplate::Text02);         // 标题+正文两行模板
+    t.setTextField(head, WinToastTemplate::FirstLine);
+    t.setTextField(names, WinToastTemplate::SecondLine);
+    t.setAudioOption(WinToastTemplate::AudioOption::Default);
+    if (g_lastToastId >= 0) WinToast::instance()->hideToast(g_lastToastId);   // 先清空上一次叫号通知
+    WinToast::WinToastError err = WinToast::WinToastError::NoError;
+    g_lastToastId = WinToast::instance()->showToast(t, &g_toastHandler, &err);   // 显示本次并记住ID
+    if (g_lastToastId < 0)
+        PostMessageW(g_hwnd, WM_APP_STATUS, 0,
+                     (LPARAM)new std::wstring(L"Toast发送失败(Error Code " +
+                                              std::to_wstring((int)err) + L")"));
+    else
+        PostMessageW(g_hwnd, WM_APP_STATUS, 1, (LPARAM)new std::wstring(L"Toast已发送"));
+}
+#else
+// 未集成 WinToast 库时的空实现(编译始终通过)
+static void WinToastInit() {}
+static void ToastCall(const QCall&) {}
+#endif
+
 // ---------------- 主窗口 ----------------
 // 功能: 主窗口过程: 初始化/定时器/命令分发/自定义消息/自绘/退出清理
 // 参数: hwnd 窗口句柄; msg 消息; wp/lp 消息参数
@@ -906,12 +1142,12 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btnBlack = CreateWindowExW(0, L"BUTTON", L"黑屏",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_BLACK, g_hInst, nullptr);
-        g_btnChat = CreateWindowExW(0, L"BUTTON", L"对话",
-                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_CHAT, g_hInst, nullptr);
         g_btnClear = CreateWindowExW(0, L"BUTTON", L"一键清空",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_CLEAR, g_hInst, nullptr);
+        g_btnChat = CreateWindowExW(0, L"BUTTON", L"对话",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_CHAT, g_hInst, nullptr);
         SubmitButton(g_btnSettings);   // 全部挂悬停跟踪钩子
         SubmitButton(g_btnBlack);
         SubmitButton(g_btnChat);
@@ -923,16 +1159,16 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_uiSnapPath.empty())
             SetTimer(hwnd, 77, g_uiDelay > 0 ? g_uiDelay : 1500, nullptr);   // --ui 自截图定时器
         StartNet();   // 启动网络线程
+        WinToastInit();   // 初始化 WinToast(未集成库时为空操作)
         return 0;
     }
     case WM_SIZE: {
-        // 4个按钮固定在右下角一排
         RECT rc;
         GetClientRect(hwnd, &rc);
         MoveWindow(g_btnSettings, rc.right - S(102), rc.bottom - S(52), S(88), S(36), TRUE);
         MoveWindow(g_btnBlack, rc.right - S(198), rc.bottom - S(52), S(88), S(36), TRUE);
-        MoveWindow(g_btnChat, rc.right - S(294), rc.bottom - S(52), S(88), S(36), TRUE);
-        MoveWindow(g_btnClear, rc.right - S(390), rc.bottom - S(52), S(88), S(36), TRUE);
+        MoveWindow(g_btnClear, rc.right - S(294), rc.bottom - S(52), S(88), S(36), TRUE);
+        MoveWindow(g_btnChat, rc.right - S(390), rc.bottom - S(52), S(88), S(36), TRUE);
         return 0;
     }
     case WM_PAINT:
@@ -986,8 +1222,12 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_NEWCALL: {
         // 新叫号入队: 接管堆上分配的对象所有权
         std::unique_ptr<QCall> m((QCall*)lp);
+        // 主窗口最小化时弹 WinToast 通知(先隐藏上一次通知再显示本次)
+        if (IsIconic(hwnd)) ToastCall(*m);
+        // 下一次叫号先自动清空上一次叫号信息, 保证本次立即显示
+        g_queue.clear();
         g_queue.push_back(*m);
-        if (g_queue.size() == 1) g_callHidden = false;   // 队列从空变非空: 立即显示
+        g_callHidden = false;   // 立即显示新叫号
         g_advanceLeft = 20;   // 重置本条显示时长
         g_flash = 10;         // 背景闪烁10拍
         std::wstring names;
@@ -1090,7 +1330,9 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_DESTROY:
-        // 退出清理: 停定时器 -> 停网络线程 -> 清对话记录
+        // 退出清理: 移除托盘图标 -> 停定时器 -> 停网络线程 -> 清对话记录
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = nullptr; }
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
@@ -1098,8 +1340,64 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ChatWipe();   // 关闭班级端后清空上一次对话
         PostQuitMessage(0);
         return 0;
+    case WM_APP_TRAY: {
+        // 托盘回调: 左键=恢复主窗口; 右键=弹出菜单(重启/关闭)
+        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        } else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 1, L"重启应用");
+            AppendMenuW(menu, MF_STRING, 2, L"关闭应用");
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+            int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+                                     pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+            if (cmd == 1) {
+                // 重启: 启动自身新实例后退出本实例
+                std::wstring exe = ExeDirW() + L"EasyCall-Board.exe";
+                STARTUPINFOW si;
+                memset(&si, 0, sizeof si);
+                si.cb = sizeof si;
+                PROCESS_INFORMATION pi;
+                memset(&pi, 0, sizeof pi);
+                if (CreateProcessW(nullptr, &exe[0], nullptr, nullptr, FALSE,
+                                   0, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                DestroyWindow(hwnd);
+            } else if (cmd == 2) {
+                DestroyWindow(hwnd);
+            }
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        // 点关闭按钮: 最小化到托盘(隐藏窗口, 不退出进程)
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 功能: 注册托盘图标(关闭窗口后驻留后台)
+// 参数: hwnd 接收托盘回调消息的窗口
+// 返回: 无(失败静默, 不影响主功能)
+static void TrayInit(HWND hwnd) {
+    g_trayIcon = MakeTrayIcon(false);   // 教室端图标: 橙下箭头
+    memset(&g_nid, 0, sizeof g_nid);
+    g_nid.cbSize = sizeof g_nid;
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon = g_trayIcon;
+    wcsncpy_s(g_nid.szTip, L"EasyCall 教室端", _TRUNCATE);
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
 // 功能: 尝试让窗口启用系统圆角(DwmSetWindowAttribute 33, 旧系统自动忽略)
@@ -1215,6 +1513,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     if (g_port <= 0 || g_port > 65535) g_port = EC_TCP_PORT;   // 端口非法用默认值
     g_title = IniGet(L"board", L"title", L"叫号");
 
+    // ---- 开机自启动: 首次启动自动注册; 以后每次启动按设置同步注册表 ----
+    if (IniGet(L"board", L"autostart_init", L"").empty()) {
+        // 第一次运行: 自动写入 HKCU\...\Run 并记录设置
+        AutoStartSet(true);
+        IniSet(L"board", L"autostart_init", L"1");
+        IniSet(L"board", L"autostart", L"1");
+    } else {
+        // 非首次: 按用户在设置里的开关同步(0=移除注册表项, 1=注册/更新路径)
+        AutoStartSet(IniGet(L"board", L"autostart", L"1") == L"1");
+    }
+
     // ---- ③ 注册3个窗口类 ----
     WNDCLASSW wc;
     memset(&wc, 0, sizeof wc);
@@ -1231,7 +1540,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 深蓝)
     wc.lpszClassName = L"EasyCallBoardDlg";
     RegisterClassW(&wc);
 
@@ -1240,7 +1549,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 深蓝)
     wc.lpszClassName = L"EasyCallChatWnd";
     RegisterClassW(&wc);
 
@@ -1252,6 +1561,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     if (!hwnd) return 1;
     EnableRoundedCorners(hwnd);
     ShowWindow(hwnd, SW_MAXIMIZE);
+    TrayInit(hwnd);   // 注册托盘图标
     UpdateWindow(hwnd);
 
     g_chatSender = BoardSendChat;   // 对话发送回调

@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>   // Shell_NotifyIconW / NOTIFYICONDATAW(托盘图标)
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -64,3 +65,9 @@ std::string JsonStrVal(const std::string& obj, const char* key);
 
 // ---------------- 自截图辅助(开发用): 32bpp BGRA 像素 -> PNG ----------------
 bool SavePng32(const std::wstring& path, const uint8_t* bgra, int w, int h);
+
+// ---------------- 托盘图标 ----------------
+// 按 icon\*.svg 的设计程序化绘制 32x32 图标:
+// teacher=true  教师端(灰容器+蓝色上箭头+浅蓝底条)
+// teacher=false 教室端(灰容器+橙色下箭头+浅橙底条)
+HICON MakeTrayIcon(bool teacher);

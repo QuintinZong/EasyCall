@@ -656,3 +656,72 @@ bool SavePng32(const std::wstring& path, const uint8_t* bgra, int w, int h) {
     CloseHandle(hf);
     return ok;
 }
+
+// ================= 托盘图标(运行时绘制, 对应 icon\*.svg 设计) =================
+// 功能: 程序化绘制 32x32 托盘图标(托盘 API 只接受 HICON, 无法直接使用 SVG;
+//       此函数按 Teacher.svg / Board.svg 的配色与构图等比重绘)
+// 参数: teacher true=教师端(灰容器+蓝色上箭头+浅蓝底条);
+//             false=教室端(灰容器+橙色下箭头+浅橙底条)
+// 返回: 成功返回图标句柄(调用方负责 DestroyIcon); 失败返回 nullptr
+HICON MakeTrayIcon(bool teacher) {
+    // 1. 建 32x32 自上而下 32bpp DIB
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = 32;
+    bmi.bmiHeader.biHeight = -32;   // 负值 = 自上而下
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP hbm = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return nullptr; }
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    HGDIOBJ oldBmp = SelectObject(dc, hbm);
+
+    // 2. 灰容器底(#B0BEC5) + 内部留白(1px 边框效果)
+    HBRUSH gray = CreateSolidBrush(RGB(0xB0, 0xBE, 0xC5));
+    RECT rcAll = { 0, 0, 32, 32 };
+    FillRect(dc, &rcAll, gray);
+    DeleteObject(gray);
+    HBRUSH white = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
+    RECT rcIn = { 1, 1, 31, 31 };
+    FillRect(dc, &rcIn, white);
+    DeleteObject(white);
+
+    // 3. 底部浅色条(教师浅蓝 / 教室浅橙)
+    HBRUSH bar = CreateSolidBrush(teacher ? RGB(0x90, 0xCA, 0xF9) : RGB(0xFF, 0xE0, 0x82));
+    RECT rcBar = { 2, 26, 30, 30 };
+    FillRect(dc, &rcBar, bar);
+    DeleteObject(bar);
+
+    // 4. 箭头(教师蓝色向上 / 教室橙色向下): 矩形箭杆 + 三角形箭头
+    HBRUSH ac = CreateSolidBrush(teacher ? RGB(0x03, 0xA9, 0xF4) : RGB(0xFF, 0xA0, 0x00));
+    HGDIOBJ oldBrush = SelectObject(dc, ac);
+    if (teacher) {
+        RECT stem = { 13, 5, 19, 17 };
+        FillRect(dc, &stem, ac);
+        POINT head[3] = { { 7, 13 }, { 25, 13 }, { 16, 22 } };   // 三角形箭头
+        Polygon(dc, head, 3);
+    } else {
+        RECT stem = { 13, 15, 19, 27 };
+        FillRect(dc, &stem, ac);
+        POINT head[3] = { { 7, 19 }, { 25, 19 }, { 16, 10 } };
+        Polygon(dc, head, 3);
+    }
+    SelectObject(dc, oldBrush);
+    DeleteObject(ac);
+
+    SelectObject(dc, oldBmp);
+    DeleteDC(dc);
+
+    // 5. DIB -> HICON(32bpp 彩色位图自带 alpha, 无需掩码位图)
+    ICONINFO ii;
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmColor = hbm;
+    HICON hIcon = CreateIconIndirect(&ii);
+    DeleteObject(hbm);
+    return hIcon;
+}
