@@ -37,6 +37,7 @@ using namespace Gdiplus;
 #define WM_APP_BLACK   (WM_APP + 4)   // 收到黑屏指令
 #define WM_APP_CHAT    (WM_APP + 5)   // 收到对话消息
 #define WM_APP_TRAY    (WM_APP + 11)  // 托盘图标回调消息(lParam 低字为鼠标事件)
+#define IDI_BOARD 1002  //托盘图标定义
 
 // ---------------- 次级窗口 Fluent 配色(暗色) ----------------
 // 设置对话框/对话窗口统一暗色主题, 与大屏深蓝底一致
@@ -1402,14 +1403,7 @@ static void TrayInit(HWND hwnd) {
         DestroyIcon(g_trayIcon);    //释放旧图标缓存
         g_trayIcon = nullptr;
     }
-    g_trayIcon = (HICON)LoadImage(
-        NULL,                               // 从文件加载，实例句柄填 NULL
-        L"easycall_icon.ico",               // 图标文件名（可改成你的实际文件名）
-        IMAGE_ICON,                         // 加载类型为图标
-        16,                                 // 目标宽度（托盘推荐 16x16）
-        16,                                 // 目标高度
-        LR_LOADFROMFILE | LR_DEFAULTCOLOR   // 关键标志：从文件加载
-    );
+    g_trayIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_BOARD));
     memset(&g_nid, 0, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = hwnd;
@@ -1550,7 +1544,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = BoardProc;                          // 主窗口
     wc.hInstance = hInst;
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_BOARD));   // 主窗口图标(与 exe 图标一致)
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;                          // 背景自绘
     wc.lpszClassName = L"EasyCallBoardWnd";

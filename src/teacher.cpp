@@ -23,6 +23,7 @@ using namespace Gdiplus;
 // 自定义消息: 网络线程收到 CHAT 帧后投递到主线程处理
 #define WM_APP_CHAT (WM_APP + 2)
 #define WM_APP_TRAY (WM_APP + 11)   // 托盘图标回调消息(lParam 低字为鼠标事件)
+#define IDI_TEACHER  1001   //托盘图标定义
 
 // 学生数据: 学号/姓名/班级(备注)
 struct Student { std::wstring id, name, cls; };
@@ -1651,7 +1652,7 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // 参数: hwnd 接收托盘回调消息的窗口
 // 返回: 无(失败静默, 不影响主功能)
 static void TrayInit(HWND hwnd) {
-    g_trayIcon = MakeTrayIcon(true);   // 教师端图标: 蓝上箭头
+    g_trayIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_TEACHER));
     memset(&g_nid, 0, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = hwnd;
@@ -1761,7 +1762,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = TeacherProc;                       // 主窗口
     wc.hInstance = hInst;
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_TEACHER));   // 主窗口图标(与 exe 图标一致)
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;                          // 背景自绘
     wc.lpszClassName = L"EasyCallTeacherWnd";

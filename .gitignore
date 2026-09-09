@@ -2,6 +2,7 @@
 build/
 dist/
 *.exe
+*.obj
 *.log
 xlsxtest.out
 students.json
