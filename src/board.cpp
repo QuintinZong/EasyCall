@@ -439,7 +439,7 @@ static void HandlePayload(const std::string& payload, bool fromTcp, SOCKET reply
         if (lines[1] == WU8(g_lastCallId)) return;   // 去重
         g_lastCallId = U8W(lines[1]);
         QCall q;
-        q.place = lines[2].empty() ? L"台前" : U8W(lines[2]);   // 地点
+        q.place = lines[2].empty() ? L"办公室" : U8W(lines[2]);   // 地点
         q.teacher = lines[3].empty() ? L"教师" : U8W(lines[3]); // 教师
         for (size_t i = 4; i < lines.size(); i++) {
             // 每个学生行按 Tab 拆成 学号/姓名/班级
@@ -546,6 +546,13 @@ static void BroadThreadProc() {
 static void RelayThreadProc() {
     std::wstring base = g_base;
     std::string room = WU8(g_room);
+    // 启动时清空服务器上本房间的残留队列(上一次会话的叫号/对话),
+    // 保证大屏每次开机都从空白开始; 服务器没有 clear.php 时静默跳过(保持旧行为)
+    if (!base.empty()) {
+        std::string resp;
+        std::wstring err;
+        HttpGet(base + L"clear.php?room=" + U8W(UrlEncode(room)), resp, err, 5);
+    }
     long long after = 0;   // 已消费的消息序号
     while (!g_stop.load()) {
         if (base.empty()) {
@@ -720,7 +727,7 @@ static void PaintDraw(HDC dc, const RECT& rc) {
         SelectObject(dc, fSub);
         SetTextColor(dc, RGB(0x99, 0x99, 0x99));
         RECT sr = { S(40), cy + S(10), rc.right - S(40), cy + S(70) };
-        DrawTextW(dc, L"请安静自习", -1, &sr, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        DrawTextW(dc, L"请安静休息/自习", -1, &sr, DT_CENTER | DT_TOP | DT_SINGLELINE);
         DeleteObject(fSub);
         return;
     }
@@ -1080,7 +1087,8 @@ static void WinToastInit() {
     }
 }
 // 功能: 通知事件回调(点击/关闭/失败等动作本系统无需处理, 全部空实现)
-// 说明: v1.3.2 的 showToast 要求处理器非空, 且必须为全局实例(库在通知存活期内引用它)
+// 注意: v1.3.2 的 showToast 会用 shared_ptr 接管处理器所有权, 通知结束时 delete,
+//       所以每次必须 new 一个新对象传入(传全局/栈对象会被 delete 导致堆损坏崩溃)
 class BoardToastHandler : public WinToastLib::IWinToastHandler {
 public:
     void toastActivated() const override {}
@@ -1089,7 +1097,6 @@ public:
     void toastDismissed(WinToastLib::IWinToastHandler::WinToastDismissalReason state) const override {}
     void toastFailed() const override {}
 };
-static BoardToastHandler g_toastHandler;   // 全局单例, 生命周期覆盖全部通知
 
 // 功能: 弹出叫号通知(标题+人名); 先隐藏上一次通知再显示本次
 // 参数: q 本次叫号(地点/教师/学生列表)
@@ -1109,7 +1116,8 @@ static void ToastCall(const QCall& q) {
     t.setAudioOption(WinToastTemplate::AudioOption::Default);
     if (g_lastToastId >= 0) WinToast::instance()->hideToast(g_lastToastId);   // 先清空上一次叫号通知
     WinToast::WinToastError err = WinToast::WinToastError::NoError;
-    g_lastToastId = WinToast::instance()->showToast(t, &g_toastHandler, &err);   // 显示本次并记住ID
+    // 每次叫号 new 一个新处理器: 库会在通知结束时 delete 它
+    g_lastToastId = WinToast::instance()->showToast(t, new BoardToastHandler(), &err);   // 显示本次并记住ID
     if (g_lastToastId < 0)
         PostMessageW(g_hwnd, WM_APP_STATUS, 0,
                      (LPARAM)new std::wstring(L"Toast发送失败(Error Code " +
@@ -1152,6 +1160,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SubmitButton(g_btnBlack);
         SubmitButton(g_btnChat);
         SubmitButton(g_btnClear);
+        if (g_mode == L"relay") ChatWipe();   // 中转模式: 启动即清本地对话残留(崩溃未清的情况)
         ChatLoad();   // 载入历史对话
         SetTimer(hwnd, 1, 1000, nullptr);   // 定时器1: 每秒重绘(刷新状态/闪烁)
         SetTimer(hwnd, 2, 300, nullptr);    // 定时器2: 300ms 闪烁节奏与黑屏重绘
@@ -1176,9 +1185,11 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == 77) {
-            // --ui 调试: 截图并退出
+            // --ui 调试: 截图并退出(此路径不走 WM_DESTROY, 必须先停网络线程再退出,
+            // 否则 EcNetStop 会在长轮询线程仍使用时销毁 WinHTTP 会话导致崩溃)
             DoUiSnap();
             KillTimer(hwnd, 77);
+            StopNet();
             PostQuitMessage(0);
             return 0;
         }
@@ -1222,8 +1233,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_NEWCALL: {
         // 新叫号入队: 接管堆上分配的对象所有权
         std::unique_ptr<QCall> m((QCall*)lp);
-        // 主窗口最小化时弹 WinToast 通知(先隐藏上一次通知再显示本次)
-        if (IsIconic(hwnd)) ToastCall(*m);
+        ToastCall(*m);
         // 下一次叫号先自动清空上一次叫号信息, 保证本次立即显示
         g_queue.clear();
         g_queue.push_back(*m);
@@ -1388,7 +1398,18 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // 参数: hwnd 接收托盘回调消息的窗口
 // 返回: 无(失败静默, 不影响主功能)
 static void TrayInit(HWND hwnd) {
-    g_trayIcon = MakeTrayIcon(false);   // 教室端图标: 橙下箭头
+    if (g_trayIcon) {
+        DestroyIcon(g_trayIcon);    //释放旧图标缓存
+        g_trayIcon = nullptr;
+    }
+    g_trayIcon = (HICON)LoadImage(
+        NULL,                               // 从文件加载，实例句柄填 NULL
+        L"easycall_icon.ico",               // 图标文件名（可改成你的实际文件名）
+        IMAGE_ICON,                         // 加载类型为图标
+        16,                                 // 目标宽度（托盘推荐 16x16）
+        16,                                 // 目标高度
+        LR_LOADFROMFILE | LR_DEFAULTCOLOR   // 关键标志：从文件加载
+    );
     memset(&g_nid, 0, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = hwnd;
