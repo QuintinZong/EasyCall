@@ -13,7 +13,17 @@
 #include <shlobj.h>
 #include <propsys.h>
 #include <objbase.h>
+#include "ec_speech_winrt.h"   // WinRT 语音朗读(与 wintoastlib 分开编译避免头冲突)
+#else
+// 未用 MSVC 构建(无 WinToast)时, 语音功能退化为空实现
+static bool SpeechStart(HWND) { return false; }
+static void SpeechSay(const std::wstring&) {}
+static void SpeechStop() {}
+static void SpeechShutdown() {}
 #endif
+
+// 通知图标: 以 RCDATA 资源内嵌 PNG(app_board.rc 1003), 运行时解出文件供通知 XML 引用
+#define IDR_TOAST_ICON 1003
 
 // MinGW 旧版 gdiplus 头文件缺少 PROPID 定义, 先补上
 typedef ULONG PROPID;
@@ -61,7 +71,7 @@ struct QCall { std::wstring place, teacher; std::vector<CallItem> items; };
 // 全部控件 ID(枚举, 无符号整型)
 enum : INT_PTR { IDC_BTN_SETTINGS = 100, IDC_BTN_BLACK, IDC_BTN_CHAT, IDC_BTN_CLEAR,
        IDC_ED_MODE, IDC_ED_BASE, IDC_ED_ROOM, IDC_ED_PORT, IDC_ED_TITLE,   // 设置对话框控件
-       IDC_CK_AUTOSTART,                                                    // 开机自启动复选框
+       IDC_CK_AUTOSTART, IDC_CK_TTS,                                        // 开机自启动 / 语音朗读复选框
        IDC_BTN_OK, IDC_BTN_CANCEL,
        IDC_CHAT_LOG = 200, IDC_CHAT_INPUT, IDC_CHAT_SEND };                // 对话窗口控件
 
@@ -76,6 +86,8 @@ static std::vector<std::wstring> g_history;       // 历史记录行(底部小�
 static std::vector<std::wstring> g_chatMsgs;      // 对话记录 "HH:MM:SS 姓名: 内容"
 static std::vector<std::string> g_sentChatIds;    // 已发送的聊天ID(中转回显去重)
 static std::wstring g_lastCallId;                 // 最近一次叫号ID(重复 CALL 去重)
+static bool g_tts = true;                         // 是否语音朗读叫号(设置里可关, ini [board] tts)
+static std::wstring g_toastIconPath;              // 从资源解出的通知图标 PNG 文件路径
 static std::wstring g_statusText = L"正在启动…";  // 顶部右侧状态文字
 static std::wstring g_title = L"叫号";            // 大屏标题(设置里可改)
 static std::wstring g_base = EC_DEFAULT_RELAY;    // 中转服务器基地址
@@ -870,9 +882,10 @@ static void DlgLayout() {
     move(IDC_ED_ROOM, y + S(22), S(24)); y += S(54);    // 房间号
     move(IDC_ED_PORT, y + S(22), S(24)); y += S(54);    // 端口
     move(IDC_ED_TITLE, y + S(22), S(24)); y += S(54);   // 标题
-    MoveWindow(GetDlgItem(g_dlg, IDC_CK_AUTOSTART), x, S(278), w, S(22), TRUE);   // 自启动开关
-    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_OK), x, S(304), S(120), S(32), TRUE);      // [保存]
-    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_CANCEL), x + S(160), S(304), S(120), S(32), TRUE);   // [取消]
+    MoveWindow(GetDlgItem(g_dlg, IDC_CK_AUTOSTART), x, S(272), w, S(22), TRUE);   // 自启动开关
+    MoveWindow(GetDlgItem(g_dlg, IDC_CK_TTS), x, S(296), w, S(22), TRUE);         // 语音朗读开关
+    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_OK), x, S(324), S(120), S(32), TRUE);      // [保存]
+    MoveWindow(GetDlgItem(g_dlg, IDC_BTN_CANCEL), x + S(160), S(324), S(120), S(32), TRUE);   // [取消]
 }
 // 功能: 设置对话框过程: 编辑模式/服务器/房间/端口/标题, [保存]写 INI
 // 参数: hwnd 窗口句柄; msg 消息; wp/lp 消息参数
@@ -915,17 +928,27 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             HWND ck = CreateWindowExW(0, L"BUTTON", L"开机自动启动(大屏)",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                      S(16), S(278), S(300), S(22), hwnd,
+                                      S(16), S(272), S(300), S(22), hwnd,
                                       (HMENU)IDC_CK_AUTOSTART, g_hInst, nullptr);
             SendMessageW(ck, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
             SendMessageW(ck, BM_SETCHECK,
                          IniGet(L"board", L"autostart", L"1") == L"1" ? BST_CHECKED : BST_UNCHECKED, 0);
         }
+        // 语音朗读开关(回显当前设置)
+        {
+            HWND ck = CreateWindowExW(0, L"BUTTON", L"语音朗读叫号",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                      S(16), S(296), S(300), S(22), hwnd,
+                                      (HMENU)IDC_CK_TTS, g_hInst, nullptr);
+            SendMessageW(ck, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
+            SendMessageW(ck, BM_SETCHECK,
+                         IniGet(L"board", L"tts", L"1") == L"1" ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
         // [保存]/[取消]按钮(自绘 Fluent 暗色风格)
         {
             HWND b = CreateWindowExW(0, L"BUTTON", L"保存",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                     S(16), S(304), S(120), S(32), hwnd, (HMENU)IDC_BTN_OK,
+                                     S(16), S(324), S(120), S(32), hwnd, (HMENU)IDC_BTN_OK,
                                      g_hInst, nullptr);
             SubmitButton(b);
             SendMessageW(b, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
@@ -933,7 +956,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             HWND b = CreateWindowExW(0, L"BUTTON", L"取消",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                     S(176), S(304), S(120), S(32), hwnd, (HMENU)IDC_BTN_CANCEL,
+                                     S(176), S(324), S(120), S(32), hwnd, (HMENU)IDC_BTN_CANCEL,
                                      g_hInst, nullptr);
             SubmitButton(b);
             SendMessageW(b, WM_SETFONT, (WPARAM)MakeFont(11, FW_NORMAL), TRUE);
@@ -1006,6 +1029,12 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 IniSet(L"board", L"autostart", as ? L"1" : L"0");
                 AutoStartSet(as);
             }
+            // 语音朗读开关: 写 INI(重启后生效)
+            {
+                bool tt = SendMessageW(GetDlgItem(hwnd, IDC_CK_TTS), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                IniSet(L"board", L"tts", tt ? L"1" : L"0");
+                g_tts = tt;   // 同步内存标志: 关掉后本次运行立即停止朗读, 打开需重启
+            }
             MessageBoxW(hwnd, L"设置已保存, 重启程序后生效", L"提示", MB_ICONINFORMATION);
             DestroyWindow(hwnd);
             return 0;
@@ -1035,7 +1064,7 @@ static void ShowSettings() {
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                                rc.left + (rc.right - rc.left) / 2 - S(190),   // 主窗口居中
                                rc.top + (rc.bottom - rc.top) / 2 - S(200),
-                               S(380), S(420), g_hwnd, nullptr, g_hInst, nullptr);
+                               S(380), S(440), g_hwnd, nullptr, g_hInst, nullptr);
     if (!dlg) { EnableWindow(g_hwnd, TRUE); return; }
     MSG m;
     while (IsWindow(dlg)) {
@@ -1070,6 +1099,29 @@ static bool AutoStartSet(bool enable) {
 }
 
 // ================= WinToast 辅助函数(未启用库时为空实现) =================
+// 功能: 把内嵌的 PNG 通知图标(RCDATA 1003)解出到 exe 同目录文件
+// 说明: 通知 XML 的 appLogoOverride 只能引用文件路径, 仿应用图标思路:
+//       图标跟随 exe(资源内嵌), 运行时解出, 免外部文件
+// 返回: 无(失败静默, 通知将使用默认应用图标)
+static void ExtractToastIcon() {
+    HRSRC r = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_TOAST_ICON), RT_RCDATA);
+    if (!r) return;
+    HGLOBAL g = LoadResource(g_hInst, r);
+    if (!g) return;
+    const void* p = LockResource(g);
+    DWORD size = SizeofResource(g_hInst, r);
+    if (!p || !size) return;
+    g_toastIconPath = ExeDirW() + L"EasyCall-ToastIcon.png";
+    std::replace(g_toastIconPath.begin(), g_toastIconPath.end(), L'\\', L'/');   // file:/// URI 用正斜杠
+    HANDLE h = CreateFileW((ExeDirW() + L"EasyCall-ToastIcon.png").c_str(), GENERIC_WRITE, 0,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(h, p, size, &w, nullptr);
+        CloseHandle(h);
+    }
+}
+
 #ifdef HAVE_WINTOAST
 // 功能: 初始化 WinToast: 设置应用名与 AUMID 后调用 initialize
 // 说明: v1.3.2 的 initialize() 内部会自动创建开始菜单快捷方式并管理 COM,
@@ -1077,6 +1129,7 @@ static bool AutoStartSet(bool enable) {
 // 返回: 无(初始化失败时在状态栏提示)
 static void WinToastInit() {
     using namespace WinToastLib;
+    ExtractToastIcon();   // 先解出通知图标文件
     WinToast::instance()->setAppName(L"EasyCall 班级大屏");
     WinToast::instance()->setAppUserModelId(
         WinToast::configureAUMI(L"QuintinZong", L"EasyCall", L"Board"));
@@ -1115,6 +1168,8 @@ static void ToastCall(const QCall& q) {
     t.setTextField(head, WinToastTemplate::FirstLine);
     t.setTextField(names, WinToastTemplate::SecondLine);
     t.setAudioOption(WinToastTemplate::AudioOption::Default);
+    if (!g_toastIconPath.empty())
+        t.setImagePath(g_toastIconPath, WinToastTemplate::CropHint::Square);   // 通知左侧应用图标
     if (g_lastToastId >= 0) WinToast::instance()->hideToast(g_lastToastId);   // 先清空上一次叫号通知
     WinToast::WinToastError err = WinToast::WinToastError::NoError;
     // 每次叫号 new 一个新处理器: 库会在通知结束时 delete 它
@@ -1125,6 +1180,21 @@ static void ToastCall(const QCall& q) {
                                               std::to_wstring((int)err) + L")"));
     else
         PostMessageW(g_hwnd, WM_APP_STATUS, 1, (LPARAM)new std::wstring(L"Toast已发送"));
+}
+// 最多5个名字  q 本次叫号
+static std::wstring BuildSpeechText(const QCall& q) {
+    std::wstring names;
+    int n = 0;
+    for (auto& it : q.items) {
+        if (n >= 5) break;
+        if (it.name.empty()) continue;
+        if (n > 0) names += L"、";
+        names += it.name;
+        n++;
+    }
+    if ((int)q.items.size() > n)
+        names += L"等" + std::to_wstring((int)q.items.size()) + L"位同学";
+    return q.teacher + L"请" + names + L"小朋友到" + q.place;
 }
 #else
 // 未集成 WinToast 库时的空实现(编译始终通过)
@@ -1170,6 +1240,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, 77, g_uiDelay > 0 ? g_uiDelay : 1500, nullptr);   // --ui 自截图定时器
         StartNet();   // 启动网络线程
         WinToastInit();   // 初始化 WinToast(未集成库时为空操作)
+        if (g_tts) SpeechStart(hwnd);   // 启动语音朗读线程(设置里可关)
         return 0;
     }
     case WM_SIZE: {
@@ -1191,6 +1262,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DoUiSnap();
             KillTimer(hwnd, 77);
             StopNet();
+            SpeechShutdown();   // 停语音线程: 未 join 的线程会在进程退出时触发 terminate
             PostQuitMessage(0);
             return 0;
         }
@@ -1224,6 +1296,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 本机[一键清空]: 只隐藏当前显示并清历史, 不清队列(下一条会自动补上)
             g_callHidden = true;
             g_history.clear();
+            SpeechStop();   // 同时停掉正在朗读的语音
             if (g_black) {
                 g_black = false;   // 黑屏状态下一并退出黑屏
                 SetWindowTextW(g_btnBlack, L"黑屏");
@@ -1235,6 +1308,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 新叫号入队: 接管堆上分配的对象所有权
         std::unique_ptr<QCall> m((QCall*)lp);
         ToastCall(*m);
+        if (g_tts) SpeechSay(BuildSpeechText(*m));   // 语音朗读本次叫号
         // 下一次叫号先自动清空上一次叫号信息, 保证本次立即显示
         g_queue.clear();
         g_queue.push_back(*m);
@@ -1260,6 +1334,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 收到教师端清屏: 清空队列与历史, 退出黑屏
         g_queue.clear();
         g_history.clear();
+        SpeechStop();   // 同时停掉正在朗读的语音
         if (g_black) {
             g_black = false;
             SetWindowTextW(g_btnBlack, L"黑屏");
@@ -1270,6 +1345,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 收到教师端黑屏指令: 进入黑屏
         g_black = true;
         SetWindowTextW(g_btnBlack, L"恢复显示");
+        SpeechStop();   // 黑屏时停掉正在朗读的语音
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     case WM_APP_CHAT: {
@@ -1348,6 +1424,7 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
         StopNet();
+        SpeechShutdown();   // 停语音朗读线程
         ChatWipe();   // 关闭班级端后清空上一次对话
         PostQuitMessage(0);
         return 0;
@@ -1527,6 +1604,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     g_port = _wtoi(IniGet(L"board", L"port", L"25800").c_str());
     if (g_port <= 0 || g_port > 65535) g_port = EC_TCP_PORT;   // 端口非法用默认值
     g_title = IniGet(L"board", L"title", L"叫号");
+    g_tts = IniGet(L"board", L"tts", L"1") != L"0";   // 语音朗读开关(默认开)
 
     // ---- 开机自启动: 首次启动自动注册; 以后每次启动按设置同步注册表 ----
     if (IniGet(L"board", L"autostart_init", L"").empty()) {

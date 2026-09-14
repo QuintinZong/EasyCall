@@ -4,7 +4,7 @@ rem  EasyCall 班级叫号系统 - 一键构建脚本
 rem  产物输出: dist\EasyCall-Teacher.exe (教师端)
 rem         dist\EasyCall-Board.exe  	  (教室端)
 rem Gtihub构建：自动调用build.bat -nopause
-rem  说明: 若 src\ 下存在 wintoastlib.h/.cpp, 教室端自动改用 MSVC 编译以支持 WinToast
+rem  说明: 若 src\ 下存在 wintoastlib.h/.cpp, 教室端自动改用 MSVC 编译以支持 WinToast 与 WinRT 语音
 rem  资源: src\app_teacher.rc / src\app_board.rc 分别携带两端各自的 exe 图标
 rem ============================================================
 setlocal enabledelayedexpansion
@@ -44,7 +44,7 @@ goto :board_mingw
 :board_msvc
 echo    使用 MSVC 构建(含 WinToast 通知)...
 call "%MSVCDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
-cl /nologo /utf-8 /permissive- /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE /DWINVER=0x0601 /D_WIN32_WINNT=0x0A00 /D_WIN32_IE=0x0600 /DHAVE_WINTOAST src\board.cpp src\ec_net.cpp src\wintoastlib.cpp build\app_board.res /Fe:dist\EasyCall-Board.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib comdlg32.lib ws2_32.lib winhttp.lib ole32.lib shell32.lib propsys.lib runtimeobject.lib advapi32.lib gdiplus.lib shlwapi.lib
+cl /nologo /utf-8 /permissive- /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE /DWINVER=0x0601 /D_WIN32_WINNT=0x0A00 /D_WIN32_IE=0x0600 /DHAVE_WINTOAST src\board.cpp src\ec_net.cpp src\wintoastlib.cpp src\ec_speech_winrt.cpp build\app_board.res /Fe:dist\EasyCall-Board.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib comdlg32.lib ws2_32.lib winhttp.lib ole32.lib shell32.lib propsys.lib runtimeobject.lib advapi32.lib gdiplus.lib shlwapi.lib windowsapp.lib
 if errorlevel 1 goto :err
 goto :build_done
 
