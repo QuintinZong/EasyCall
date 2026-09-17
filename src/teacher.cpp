@@ -38,7 +38,9 @@ enum : INT_PTR {
     IDC_LBL_PLACE, IDC_ED_PLACE, IDC_CK_CLS,
     IDC_CHAT_LOG = 200, IDC_CHAT_INPUT, IDC_CHAT_SEND,   // 对话窗口控件
     IDC_NAME_EDIT = 210, IDC_NAME_OK,                     // 教师名弹窗控件
-    IDC_ADD_ID = 220, IDC_ADD_NAME, IDC_ADD_CLS, IDC_ADD_OK, IDC_ADD_DONE   // 手动添加弹窗控件
+    IDC_ADD_ID = 220, IDC_ADD_NAME, IDC_ADD_CLS, IDC_ADD_OK, IDC_ADD_DONE,   // 手动添加弹窗控件
+    IDC_NTF_TEXT = 230, IDC_NTF_SEND, IDC_NTF_CANCEL,     // 通知大屏弹窗控件
+    IDC_BTN_NOTIFY = 240                                  // 主界面[通知大屏]按钮
 };
 
 // ---------------- Fluent 配色 ----------------
@@ -85,6 +87,7 @@ static HWND g_lblBase, g_lblRoom, g_lblNet, g_lblHisty, g_lblPlace;   // 静态�
 static HWND g_edPlace, g_ckCls;                                 // 地点编辑框 / "大屏显示班级"复选框
 static HWND g_chatWnd = nullptr, g_chatLog = nullptr, g_chatInput = nullptr;   // 对话窗口及控件
 static HWND g_addDlg = nullptr, g_nameEdit = nullptr;           // 手动添加弹窗 / 教师名编辑框
+static HWND g_notifyDlg = nullptr;                              // 通知大屏弹窗
 static std::vector<HWND> g_controls;                            // 统一设字体的控件集合
 static std::vector<Student> g_students;                         // 学生名单(内存)
 static std::vector<std::wstring> g_chatMsgs;       // 对话记录 "HH:MM:SS 姓名: 内容"
@@ -318,6 +321,23 @@ static bool TeacherSendChat(const std::wstring& text) {
         return false;
     }
     ChatAppend(g_teacherName, t);
+    return true;
+}
+
+// 功能: 教师端发送通知: 构造 NOTIFY 报文发到大屏, 大屏收到后强制全屏显示
+// 参数: text 通知文本
+// 返回: true=发送成功; false=文本为空或发送失败
+static bool TeacherSendNotify(const std::wstring& text) {
+    std::wstring t = TrimW(text);
+    if (t.empty()) return false;
+    std::string msgId = NowStampMs();   // 消息ID = 毫秒时间戳
+    std::string payload = "NOTIFY\n" + msgId + "\n" + WU8(g_teacherName) + "\n" + WU8(t);
+    std::wstring err;
+    if (!SendToBoard(payload, err)) {
+        ChatAppend(L"系统", L"通知发送失败: " + err);
+        return false;
+    }
+    ChatAppend(g_teacherName + L"(通知)", t);
     return true;
 }
 
@@ -672,6 +692,129 @@ static void ShowAddDialog() {
                                mrc.left + (mrc.right - mrc.left) / 2 - S(160),   // 主窗口居中
                                mrc.top + (mrc.bottom - mrc.top) / 2 - S(100),
                                S(330), S(190), g_hwnd, nullptr, g_hInst, nullptr);
+}
+
+// ---------------- 通知大屏弹窗(owned, 非模态) ----------------
+// 功能: 通知输入框子类过程: 回车即触发[发送通知]按钮
+// 参数: h 输入框句柄; m 消息; w/l 消息参数
+// 返回: 处理则返回0; 否则交回原窗口过程
+static LRESULT CALLBACK NotifyInputProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) {
+        PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_NTF_SEND, BN_CLICKED), (LPARAM)h);
+        return 0;
+    }
+    return CallWindowProcW((WNDPROC)GetPropW(h, L"EcOrigProc"), h, m, w, l);
+}
+// 功能: 通知大屏弹窗过程: 输入通知文字 -> [发送通知]发到大屏, [取消]关闭
+// 参数: hwnd 窗口句柄; msg 消息; wp/lp 消息参数
+// 返回: 按 Win32 窗口过程约定
+static LRESULT CALLBACK NotifyDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        // 提示标签
+        HWND lbl = CreateWindowExW(0, L"STATIC", L"通知内容",
+                                   WS_CHILD | WS_VISIBLE, S(18), S(20), S(330), S(20),
+                                   hwnd, nullptr, g_hInst, nullptr);
+        SendMessageW(lbl, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        // 通知文字输入框(回车即发送)
+        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                  S(18), S(48), S(330), S(26), hwnd, (HMENU)IDC_NTF_TEXT,
+                                  g_hInst, nullptr);
+        SendMessageW(ed, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        WNDPROC orig = (WNDPROC)GetWindowLongPtrW(ed, GWLP_WNDPROC);
+        SetPropW(ed, L"EcOrigProc", (HANDLE)orig);
+        SetWindowLongPtrW(ed, GWLP_WNDPROC, (LONG_PTR)NotifyInputProc);
+        // [发送通知]主按钮 / [取消]普通按钮(自绘 Fluent)
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"发送通知",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(40), S(92), S(140), S(32), hwnd, (HMENU)IDC_NTF_SEND,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        }
+        {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"取消",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     S(200), S(92), S(110), S(32), hwnd, (HMENU)IDC_NTF_CANCEL,
+                                     g_hInst, nullptr);
+            SubmitButton(b);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        }
+        SetFocus(ed);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // 背景统一在 WM_PAINT 里画, 防闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);   // 统一浅灰背景
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:   // 静态标签
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLORBTN:      // 按钮底色(自绘按钮不影响)
+        return LightCtlColor((HDC)wp, 0);
+    case WM_CTLCOLOREDIT:     // 输入编辑框: 白底
+        return LightCtlColor((HDC)wp, 1);
+    case WM_DRAWITEM: {
+        // 自绘按钮绘制入口([发送通知]主题色 / [取消]普通)
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlType == ODT_BUTTON) {
+            wchar_t txt[128];
+            GetWindowTextW(d->hwndItem, txt, 128);
+            bool primary = (GetDlgCtrlID(d->hwndItem) == IDC_NTF_SEND);
+            DrawFluentButton(d->hDC, d->rcItem, txt, primary,
+                             g_hoverBtn == d->hwndItem,
+                             (d->itemState & ODS_SELECTED) != 0,
+                             (d->itemState & ODS_DISABLED) != 0,
+                             primary ? g_fontBold : g_fontUi);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_NTF_SEND) {
+            // 发通知: 清空输入框并保持弹窗打开(便于连续通知), 焦点回输入框
+            std::wstring t = TrimW(WinText(GetDlgItem(hwnd, IDC_NTF_TEXT)));
+            if (!t.empty()) TeacherSendNotify(t);
+            SetWindowTextW(GetDlgItem(hwnd, IDC_NTF_TEXT), L"");
+            SetFocus(GetDlgItem(hwnd, IDC_NTF_TEXT));
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_NTF_CANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        g_notifyDlg = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+// 功能: 打开通知大屏弹窗(非模态, 已存在则置前台)
+// 参数: 无
+// 返回: 无
+static void ShowNotifyDialog() {
+    if (g_notifyDlg && IsWindow(g_notifyDlg)) {
+        SetForegroundWindow(g_notifyDlg);
+        return;
+    }
+    RECT mrc;
+    GetWindowRect(g_hwnd, &mrc);
+    g_notifyDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"EasyCallNotifyDlg", L"通知大屏",
+                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                  mrc.left + (mrc.right - mrc.left) / 2 - S(190),   // 主窗口居中
+                                  mrc.top + (mrc.bottom - mrc.top) / 2 - S(90),
+                                  S(380), S(180), g_hwnd, nullptr, g_hInst, nullptr);
 }
 
 // ---------------- 学生名单持久化 ----------------
@@ -1217,6 +1360,7 @@ static void Layout() {
     MoveCtl(IDC_BTN_INVERT, M + S(368), y, S(62), h1);
     MoveCtl(IDC_BTN_DEL, M + S(438), y, S(88), h1);
     MoveCtl(IDC_BTN_CHAT, M + S(534), y, S(70), h1);
+    MoveCtl(IDC_BTN_NOTIFY, M + S(612), y, S(84), h1);   // [通知大屏]
 
     int y2 = y + h1 + S(10), h2 = S(44);   // 第二排: 叫号/清屏/黑屏/班级勾选/地点
     MoveCtl(IDC_BTN_CALL, M, y2, S(138), h2);
@@ -1289,7 +1433,7 @@ static void CreateControls(HWND hwnd) {
         { L"导入Excel", IDC_BTN_IMPORT }, { L"手动添加", IDC_BTN_MANUAL },
         { L"全选", IDC_BTN_SELALL }, { L"全不选", IDC_BTN_SELNONE },
         { L"反选", IDC_BTN_INVERT }, { L"删除选中", IDC_BTN_DEL },
-        { L"对话", IDC_BTN_CHAT }, { L"叫 号", IDC_BTN_CALL },
+        { L"对话", IDC_BTN_CHAT }, { L"通知大屏", IDC_BTN_NOTIFY }, { L"叫 号", IDC_BTN_CALL },
         { L"发送清屏", IDC_BTN_CLEAR }, { L"一键黑屏", IDC_BTN_BLACK },
         { L"扫描教室", IDC_BTN_SCAN }, { L"测试连接", IDC_BTN_TEST }
     };
@@ -1466,6 +1610,7 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 cid == IDC_BTN_INVERT || cid == IDC_BTN_DEL ||
                                 cid == IDC_BTN_CHAT || cid == IDC_BTN_CALL ||
                                 cid == IDC_BTN_CLEAR || cid == IDC_BTN_BLACK ||
+                                cid == IDC_BTN_NOTIFY ||
                                 cid == IDC_BTN_SCAN || cid == IDC_BTN_TEST;
                 if (isFluent) {
                     wchar_t txt[128];
@@ -1586,6 +1731,7 @@ static LRESULT CALLBACK TeacherProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_IMPORT: DoImport(hwnd); break;
         case IDC_BTN_MANUAL: ShowAddDialog(); break;
         case IDC_BTN_CHAT: EnsureChatWindow(); break;
+        case IDC_BTN_NOTIFY: ShowNotifyDialog(); break;   // [通知大屏]弹窗
         case IDC_BTN_SELALL: SetAllChecked(true); break;
         case IDC_BTN_SELNONE: SetAllChecked(false); break;
         case IDC_BTN_INVERT: InvertChecked(); break;
@@ -1793,6 +1939,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nShow) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 浅灰)
     wc.lpszClassName = L"EasyCallAddDlg";
+    RegisterClassW(&wc);
+
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = NotifyDlgProc;                      // 通知大屏弹窗
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;                          // 背景自绘(Fluent 浅灰)
+    wc.lpszClassName = L"EasyCallNotifyDlg";
     RegisterClassW(&wc);
 
     // ---- ③ 创建并显示主窗口 ----

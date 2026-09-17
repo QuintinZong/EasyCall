@@ -46,6 +46,7 @@ using namespace Gdiplus;
 #define WM_APP_STATUS  (WM_APP + 3)   // 网络状态变化(wp=1在线, 0离线; lp=新状态文本)
 #define WM_APP_BLACK   (WM_APP + 4)   // 收到黑屏指令
 #define WM_APP_CHAT    (WM_APP + 5)   // 收到对话消息
+#define WM_APP_NOTIFY  (WM_APP + 6)   // 收到教师端通知(强制全屏显示)
 #define WM_APP_TRAY    (WM_APP + 11)  // 托盘图标回调消息(lParam 低字为鼠标事件)
 #define IDI_BOARD 1002  //托盘图标定义
 
@@ -86,6 +87,8 @@ static std::vector<std::wstring> g_history;       // 历史记录行(底部小�
 static std::vector<std::wstring> g_chatMsgs;      // 对话记录 "HH:MM:SS 姓名: 内容"
 static std::vector<std::string> g_sentChatIds;    // 已发送的聊天ID(中转回显去重)
 static std::wstring g_lastCallId;                 // 最近一次叫号ID(重复 CALL 去重)
+static std::wstring g_lastNotifyId;               // 最近一次通知ID(重复 NOTIFY 去重)
+static std::wstring g_notifyTeacher, g_notifyText;   // 通知状态: 老师名 + 内容(空=无通知)
 static bool g_tts = true;                         // 是否语音朗读叫号(设置里可关, ini [board] tts)
 static std::wstring g_toastIconPath;              // 从资源解出的通知图标 PNG 文件路径
 static std::wstring g_statusText = L"正在启动…";  // 顶部右侧状态文字
@@ -469,6 +472,9 @@ static void HandlePayload(const std::string& payload, bool fromTcp, SOCKET reply
         }
     } else if (lines[0] == "CHAT") {
         PostMessageW(g_hwnd, WM_APP_CHAT, 0, (LPARAM)new std::string(payload));
+    } else if (lines[0] == "NOTIFY") {
+        // 教师端发来的通知: 强制全屏显示
+        PostMessageW(g_hwnd, WM_APP_NOTIFY, 0, (LPARAM)new std::string(payload));
     } else if (lines[0] == "CLEAR") {
         PostMessageW(g_hwnd, WM_APP_CLEAR, 0, 0);
     } else if (lines[0] == "BLACK") {
@@ -775,6 +781,60 @@ static void PaintDraw(HDC dc, const RECT& rc) {
     DeleteObject(fSt);
 
     int mainTop = topH + S(26);   // 主内容区上缘
+
+    if (!g_notifyText.empty()) {
+        // ---- 通知状态: 顶部小字"通知老师: X" + 居中大字号通知内容 ----
+        HFONT fSub = MakeFont(15, FW_NORMAL);
+        SelectObject(dc, fSub);
+        SetTextColor(dc, RGB(255, 214, 90));   // 金色小字
+        RECT hr = { S(40), mainTop, rc.right - S(40), mainTop + S(34) };
+        DrawTextW(dc, (L"通知老师: " + g_notifyTeacher).c_str(), -1, &hr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DeleteObject(fSub);
+        // 通知内容: 按行拆分, 逐行缩小字号直到最宽行能放下
+        std::vector<std::wstring> nlines;
+        {
+            size_t pos = 0;
+            for (;;) {
+                size_t nl = g_notifyText.find(L'\n', pos);
+                nlines.push_back(g_notifyText.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos));
+                if (nl == std::wstring::npos) break;
+                pos = nl + 1;
+            }
+        }
+        int pts = 46;
+        int maxW = rc.right - S(80);
+        HFONT fBig = nullptr;
+        for (;;) {
+            if (fBig) DeleteObject(fBig);
+            fBig = MakeFont(pts, FW_BOLD);
+            HGDIOBJ oldF = SelectObject(dc, fBig);
+            int widest = 0;
+            for (auto& line : nlines) {
+                SIZE sz;
+                if (GetTextExtentPoint32W(dc, line.c_str(), (int)line.size(), &sz))
+                    widest = (std::max)(widest, (int)sz.cx);
+            }
+            SelectObject(dc, oldF);
+            if (widest <= maxW || pts <= 16) break;
+            pts -= 2;
+        }
+        HGDIOBJ oldF = SelectObject(dc, fBig);
+        SetTextColor(dc, RGB(245, 245, 245));
+        SetTextAlign(dc, TA_CENTER | TA_TOP);
+        int cx = rc.right / 2;
+        int lineH = MulDiv(pts, g_dpi, 72) + S(18);
+        int y = mainTop + S(70);
+        for (auto& line : nlines) {
+            TextOutW(dc, cx, y, line.c_str(), (int)line.size());
+            y += lineH;
+        }
+        SetTextAlign(dc, TA_LEFT | TA_TOP);
+        SelectObject(dc, oldF);
+        DeleteObject(fBig);
+        return;   // 通知状态不画叫号与历史
+    }
+
     if (!g_queue.empty() && !g_callHidden) {
         // ---- 有叫号: 显示队首 ----
         const QCall& q = g_queue.front();
@@ -1296,6 +1356,8 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 本机[一键清空]: 只隐藏当前显示并清历史, 不清队列(下一条会自动补上)
             g_callHidden = true;
             g_history.clear();
+            g_notifyText.clear();   // 清空通知显示
+            g_notifyTeacher.clear();
             SpeechStop();   // 同时停掉正在朗读的语音
             if (g_black) {
                 g_black = false;   // 黑屏状态下一并退出黑屏
@@ -1312,6 +1374,8 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 下一次叫号先自动清空上一次叫号信息, 保证本次立即显示
         g_queue.clear();
         g_queue.push_back(*m);
+        g_notifyText.clear();   // 新叫号覆盖通知显示
+        g_notifyTeacher.clear();
         g_callHidden = false;   // 立即显示新叫号
         g_advanceLeft = 20;   // 重置本条显示时长
         g_flash = 10;         // 背景闪烁10拍
@@ -1334,6 +1398,8 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 收到教师端清屏: 清空队列与历史, 退出黑屏
         g_queue.clear();
         g_history.clear();
+        g_notifyText.clear();   // 一并清空通知显示
+        g_notifyTeacher.clear();
         SpeechStop();   // 同时停掉正在朗读的语音
         if (g_black) {
             g_black = false;
@@ -1352,6 +1418,33 @@ static LRESULT CALLBACK BoardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 网络线程投递的 CHAT 帧(heap 上 new 的 string, 所有权转移)
         std::unique_ptr<std::string> f((std::string*)lp);
         OnChatFrame(*f);
+        return 0;
+    }
+    case WM_APP_NOTIFY: {
+        // 教师端发来的通知: 解析并强制全屏显示(托盘隐藏时也恢复)
+        std::unique_ptr<std::string> f((std::string*)lp);
+        std::vector<std::string> lines = SplitLines(*f);
+        if (lines.size() < 3 || lines[0] != "NOTIFY") return 0;
+        if (lines[1] == WU8(g_lastNotifyId)) return 0;   // 去重
+        g_lastNotifyId = U8W(lines[1]);
+        g_notifyTeacher = U8W(lines[2]);
+        std::wstring text;
+        for (size_t i = 3; i < lines.size(); i++) {
+            if (i > 3) text += L"\n";
+            text += U8W(lines[i]);
+        }
+        if (text.empty()) return 0;
+        g_notifyText = text;
+        // 退出黑屏; 无论最小化/托盘隐藏都恢复并最大化
+        if (g_black) {
+            g_black = false;
+            SetWindowTextW(g_btnBlack, L"黑屏");
+        }
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_MAXIMIZE);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     }
     case WM_APP_STATUS: {
@@ -1538,10 +1631,11 @@ static void DoUiSnap() {
     HANDLE lg = CreateFileW((ExeDirW() + L"uisnap.log").c_str(), GENERIC_WRITE, 0, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (lg != INVALID_HANDLE_VALUE) {
-        // 记录 截图是否成功/队列长度/队首教师/状态文字, 供自动化比对
+        // 记录 截图是否成功/队列长度/队首教师/通知/状态文字, 供自动化比对
         std::string msg = "ok=" + std::to_string((int)ok) +
                           " queue=" + std::to_string((int)g_queue.size()) +
                           " head=" + (g_queue.empty() ? "-" : WU8(g_queue.front().teacher)) +
+                          " notify=" + (g_notifyText.empty() ? "-" : WU8(g_notifyTeacher)) +
                           " status=" + WU8(g_statusText) + "\n";
         DWORD w = 0;
         WriteFile(lg, msg.data(), (DWORD)msg.size(), &w, nullptr);
